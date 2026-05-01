@@ -1,0 +1,12 @@
+PyQt6>=6.4.0
+matplotlib>=3.7.0
+numpy>=1.24.0
+
+# aicspylibrary
+# scikit-image
+# scipy
+# cellpose
+# skan
+# pandas
+# napari
+ 
