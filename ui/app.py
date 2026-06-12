@@ -11,15 +11,15 @@ Scope — Main application window
   Bottom:      Data table (img_name, num, x, y, z, length) + Export
 
 CZI loading strategy (handles up to ~10 GB):
-  • Uses `czifile` (pure-Python, no CMake/C++ build required).
-  • Raw pixel data is read dimension-by-dimension — never the whole file at once.
-  • Z-max projection is built slice-by-slice so peak RAM ≈ 2 × one_slice.
-  • Each Z slice is processed (contrast-stretch + Gaussian denoise) on demand
-    inside ZSliceCanvas.show_slice(), keeping RAM flat regardless of file size.
-  • Channel compositing uses only the current slice.
+  • Uses `czifile` (the 2026 pure-Python rewrite, no CMake/C++ build required).
+  • The channel count and channel names are read directly from the pixel data
+    via  img.sizes['C']  and  img.channels  — NOT guessed from a scene loop.
+  • The fluorescence subset is the LAST 4 channels of the true C count.
+  • Each Z slice is read on demand with  img(C=c, Z=z).asarray()  so peak RAM
+    stays ≈ one slice regardless of total file size.
 
 Install:
-    pip install czifile scikit-image numpy matplotlib PyQt6
+    pip install -U "czifile[all]" scikit-image numpy matplotlib PyQt6
 """
 
 import sys
@@ -34,10 +34,10 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QFrame,
     QHeaderView, QSizePolicy, QToolButton,
     QFileDialog, QStatusBar, QProgressDialog,
-    QComboBox,
+    QComboBox, QMessageBox,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, pyqtSlot, QObject
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QAction, QActionGroup
 
 import matplotlib
 matplotlib.use("QtAgg")
@@ -54,56 +54,133 @@ MODE_NORMAL = "normal"
 MODE_ADD    = "add"
 MODE_DELETE = "delete"
 
+# Default false-colour fallback palette
+CHANNEL_COLOURS = [
+    [1.0, 0.0,   1.0  ],   # magenta  (AF647)
+    [1.0, 0.094, 0.0  ],   # red-orange (AF568)
+    [0.0, 1.0,   0.2  ],   # green    (AF488)
+    [0.0, 0.8,   1.0  ],   # cyan     (DAPI)
+    [1.0, 1.0,   0.0  ],   # yellow
+    [0.0, 0.0,   1.0  ],   # blue
+]
+
+# Known fluorophore display colours matched by channel name prefix (case-insensitive).
+FLUORO_COLOURS: list = [
+    ("af647", [1.0,  0.0,   1.0  ]),   # #FF00FF  magenta
+    ("af568", [1.0,  0.094, 0.0  ]),   # #FF1800  red-orange
+    ("af488", [0.0,  1.0,   0.2  ]),   # #00FF33  green
+    ("dapi",  [0.0,  0.8,   1.0  ]),   # #00CCFF  cyan
+]
+
+
+def _colour_for_channel(name: str, color_hex: str, fallback_idx: int) -> list:
+    name_lo = (name or "").lower()
+    for prefix, rgb in FLUORO_COLOURS:
+        if name_lo.startswith(prefix):
+            return rgb
+    parsed = _hex_to_rgb_float(color_hex) if color_hex else None
+    if parsed is not None:
+        return parsed
+    return CHANNEL_COLOURS[fallback_idx % len(CHANNEL_COLOURS)]
+
+
+# ---------------------------------------------------------------------------
+# Normalisation helpers
+# ---------------------------------------------------------------------------
+
+def _norm_to_float(arr2d: np.ndarray, lo_pct: float = 0.5, hi_pct: float = 99.5) -> np.ndarray:
+    a = arr2d.astype(np.float32)
+    lo = float(np.percentile(a, lo_pct))
+    hi = float(np.percentile(a, hi_pct))
+    if hi > lo:
+        a = (a - lo) / (hi - lo)
+    else:
+        a = np.zeros_like(a)
+    return np.clip(a, 0.0, 1.0)
+
+
+def _to_uint8(arr: np.ndarray) -> np.ndarray:
+    return (_norm_to_float(arr) * 255).astype(np.uint8)
+
+
+def _process_slice(arr2d: np.ndarray) -> np.ndarray:
+    from skimage import filters
+    f = _norm_to_float(arr2d)
+    f = filters.gaussian(f, sigma=0.8)
+    return (np.clip(f, 0, 1) * 255).astype(np.uint8)
+
+
+def _colourise(arr2d: np.ndarray, colour: list) -> np.ndarray:
+    f = _norm_to_float(arr2d)
+    rgb = np.stack([f * colour[0],
+                    f * colour[1],
+                    f * colour[2]], axis=-1)
+    return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Plane-selection helper (works with the 2026 czifile API)
+# ---------------------------------------------------------------------------
+
+def _select_plane(img, dims, c_idx: int, z_idx: int) -> np.ndarray:
+    """
+    Read a single (Y, X) plane for absolute channel c_idx and Z z_idx from a
+    czifile CziImage.
+
+    The 2026 czifile API selects dimensions by CALLING the image object, e.g.
+        img(C=20, Z=5).asarray()
+    Selections are absolute coordinates.  Any non-spatial dimension we are not
+    explicitly addressing (T, H, R, S, ...) is pinned to 0 so the result
+    squeezes down to 2-D.
+    """
+    kwargs = {}
+    for d in dims:
+        if d in ("Y", "X"):
+            continue
+        if d == "C":
+            kwargs["C"] = c_idx
+        elif d == "Z":
+            kwargs["Z"] = z_idx
+        else:
+            kwargs[d] = 0
+    arr = img(**kwargs).asarray()
+    return np.squeeze(arr)
+
 
 # ---------------------------------------------------------------------------
 # CZI loader  (runs in a background QThread)
 # ---------------------------------------------------------------------------
 
-def _to_uint8(arr: np.ndarray) -> np.ndarray:
-    """Stretch a 2-D array to uint8 [0, 255]."""
-    a = arr.astype(np.float32)
-    lo, hi = a.min(), a.max()
-    if hi > lo:
-        a = (a - lo) / (hi - lo) * 255.0
-    return np.clip(a, 0, 255).astype(np.uint8)
-
-
-def _process_slice(arr2d: np.ndarray) -> np.ndarray:
-    """
-    Per-layer processing pipeline (uint8 in, uint8 out):
-      1. Percentile contrast stretch (p2 / p98)
-      2. Mild Gaussian denoise (σ=1)
-    Runs entirely on a 2-D array — no full-stack memory needed.
-    """
-    from skimage import filters, exposure
-    a = arr2d.astype(np.float32)
-    p2, p98 = float(np.percentile(a, 2)), float(np.percentile(a, 98))
-    if p98 > p2:
-        a = exposure.rescale_intensity(a, in_range=(p2, p98))  # type: ignore[arg-type]
-    a = filters.gaussian(a, sigma=1)
-    return _to_uint8(a)
-
-
 class CziSignals(QObject):
-    progress   = pyqtSignal(str)          # status message
-    pct        = pyqtSignal(int)          # 0-100
-    finished   = pyqtSignal(object)       # CziData dict on success
-    error      = pyqtSignal(str)          # error message
+    progress = pyqtSignal(str)
+    pct      = pyqtSignal(int)
+    finished = pyqtSignal(object)   # CziData dict
+    error    = pyqtSignal(str)
 
 
 class CziLoader(QThread):
     """
-    Background thread that:
-      1. Opens the .czi file with czifile.
-      2. Reads metadata (dims, shape, pixel size).
-      3. Builds the max-Z projection channel-by-channel, slice-by-slice.
-      4. Does NOT load the full stack into RAM.
+    Background thread:
+      1. Opens .czi with czifile (2026 rewrite).
+      2. Picks a scene image handle (img = czi.scenes[key]).
+      3. Reads the TRUE channel count from img.sizes['C'] and the channel
+         names from img.channels — the authoritative pixel-data values.
+      4. Derives the fluorescence subset as the LAST 4 channels.
+      5. Builds a max-Z composite projection over that subset, plane-by-plane.
+
+    Why this is the fix:
+      The previous version counted channels by flattening czi.scenes into a
+      per-scene "channel_map" and using its length.  Channels are a dimension
+      *inside* a scene (shared across scenes), not a per-scene concatenation,
+      so that count collapsed to 4 and "last 4 of 4" became the first 4.
+      We now read C straight from the pixel data, so a 24-channel file reports
+      24 and the subset is [20, 21, 22, 23].
     """
 
     def __init__(self, path: str, channel: int = 0):
         super().__init__()
         self.path    = path
-        self.channel = channel          # which channel to use for projection
+        self.channel = channel
         self.signals = CziSignals()
         self._abort  = False
 
@@ -120,178 +197,313 @@ class CziLoader(QThread):
 
             czi = czifile.CziFile(self.path)
 
-            # -----------------------------------------------------------
-            # Axes / shape discovery
-            # czifile does NOT expose .axes / .shape on CziFile itself.
-            # The array is obtained via asarray(); shape is inferred from
-            # it plus the XML metadata (SizeZ, Channel count, pixel size).
-            # -----------------------------------------------------------
-            self.signals.progress.emit("Reading array structure…")
-
-            # asarray() for large files returns a memory-mapped view so
-            # no pixels are loaded until individual elements are accessed.
-            data: np.ndarray = czi.asarray()
-            raw_shape: tuple = data.shape   # e.g. (1, 1, C, Z, Y, X, 1)
-            ndim: int = data.ndim
-
-            # ---- Parse metadata XML -----------------------------------
-            n_z: int        = 1
-            n_c: int        = 1
-            um_per_px: float = 1.0
+            # ── Pick a scene image handle ────────────────────────────────
+            self.signals.progress.emit("Reading file structure…")
             try:
-                meta_xml: str = czi.metadata()  # type: ignore[call-arg]
+                scene_keys = list(czi.scenes.keys())
+            except Exception:
+                scene_keys = []
+
+            if scene_keys:
+                scene_key = scene_keys[0]
+                img = czi.scenes[scene_key]
+            else:
+                # File reports no explicit scenes — merge whatever exists.
+                scene_key = None
+                img = czi.scenes()
+
+            if len(scene_keys) > 1:
+                print(f"[Scope] NOTE: file has {len(scene_keys)} scenes "
+                      f"{scene_keys}; using scene {scene_key}. "
+                      "Tell me if you need them merged into one view.")
+
+            dims  = tuple(img.dims)
+            sizes = dict(img.sizes)
+            ndim  = len(img.shape)
+
+            # ── TRUE channel count + Z, straight from the pixel data ─────
+            n_c_pixel = int(sizes.get("C", 1))
+            n_z       = int(sizes.get("Z", 1))
+
+            # ── Channel names from the pixel data (authoritative) ────────
+            try:
+                pixel_names = [str(n) for n in img.channels]
+            except Exception:
+                pixel_names = []
+            while len(pixel_names) < n_c_pixel:
+                pixel_names.append(f"Ch{len(pixel_names)}")
+
+            # ── Cross-check + display colours + pixel size from XML ──────
+            um_per_px = 1.0
+            xml_names: list = []
+            xml_colours: list = []
+            try:
+                meta_xml: str = czi.metadata()
                 root = ET.fromstring(meta_xml)
 
-                ch_els = list(root.iter("Channel"))
-                if ch_els:
-                    n_c = len(ch_els)
+                channels_container = None
+                for candidate in root.iter("Channels"):
+                    channels_container = candidate
+                    break
 
-                for el in root.iter("SizeZ"):
-                    if el.text:
-                        n_z = max(1, int(el.text))
-                        break
+                if channels_container is not None:
+                    for ch_el in channels_container.findall("Channel"):
+                        xml_names.append(ch_el.get("Name", "") or "")
+                        col_el = ch_el.find("Color")
+                        if col_el is not None and col_el.text:
+                            xml_colours.append(col_el.text.strip())
+                        else:
+                            xml_colours.append("")
 
                 for dist in root.iter("Distance"):
-                    id_attr = dist.get("Id", "")
-                    val_el  = dist.find("Value")
-                    if id_attr == "X" and val_el is not None and val_el.text is not None:
-                        um_per_px = float(val_el.text) * 1e6   # m → µm
+                    if dist.get("Id", "") == "X":
+                        val_el = dist.find("Value")
+                        if val_el is not None and val_el.text is not None:
+                            um_per_px = float(val_el.text) * 1e6
                         break
-            except Exception:
-                pass   # fall back to shape inference
 
-            # ---- Fallback: infer C/Z from array shape -----------------
-            squeezed  = np.squeeze(data)
-            sq_shape  = squeezed.shape
-            if n_z == 1 and n_c == 1:
-                if squeezed.ndim == 4:
-                    n_c, n_z = int(sq_shape[0]), int(sq_shape[1])
-                elif squeezed.ndim == 3:
-                    n_z = int(sq_shape[0])
+            except Exception as e:
+                print(f"[Scope] Metadata parse warning: {e}")
 
-            # Clamp to what the array actually contains
-            if ndim >= 4:
-                n_z = max(1, min(n_z, raw_shape[ndim - 4]))
-            if ndim >= 5:
-                n_c = max(1, min(n_c, raw_shape[ndim - 5]))
+            # ── Build channel_info (length == n_c_pixel) ─────────────────
+            # Prefer pixel-data names; enrich with XML colours where indices
+            # line up; fall back to XML names only if a pixel name is blank.
+            channel_info: list = []
+            for i in range(n_c_pixel):
+                name = pixel_names[i] if i < len(pixel_names) else f"Ch{i}"
+                if not name and i < len(xml_names):
+                    name = xml_names[i]
+                colour_hex = xml_colours[i] if i < len(xml_colours) else ""
+                channel_info.append({"name": name, "color_hex": colour_hex})
+
+            # ── Fluorescence subset = the LAST 4 channels ────────────────
+            subset_size    = min(4, n_c_pixel)
+            channel_subset = list(range(n_c_pixel - subset_size, n_c_pixel))
+
+            # ── Diagnostics (so the file's real structure is visible) ────
+            print("\n" + "=" * 64)
+            print(f"[Scope] File : {os.path.basename(self.path)}")
+            print(f"[Scope] dims = {dims}")
+            print(f"[Scope] sizes= {sizes}")
+            print(f"[Scope] C (pixel data) = {n_c_pixel}   "
+                  f"C (XML <Channel> count) = {len(xml_names)}")
+            if xml_names and len(xml_names) != n_c_pixel:
+                print("[Scope] WARNING: XML channel count != pixel channel count. "
+                      "Indexing uses the pixel-data count (you can only read "
+                      "channels that exist as pixels).")
+            print(f"[Scope] Z = {n_z}   {um_per_px:.4f} µm/px")
+            print(f"[Scope] All {n_c_pixel} channels:")
+            for i, ch in enumerate(channel_info):
+                marker     = " ◀ fluorescence (used)" if i in channel_subset else ""
+                colour_tag = ch['color_hex'] if ch['color_hex'] else "(name-matched colour)"
+                print(f"  [{i:2d}]  name='{ch['name']}'  display_colour={colour_tag}{marker}")
+            print(f"[Scope] Fluorescence subset (last {subset_size}): {channel_subset}")
+            print("=" * 64 + "\n")
 
             self.signals.progress.emit(
-                f"Shape: {raw_shape}  |  Z={n_z}  C={n_c}  "
-                f"|  {um_per_px:.4f} µm/px"
+                f"dims={dims}  |  C={n_c_pixel}  Z={n_z}  |  {um_per_px:.4f} µm/px"
             )
             self.signals.pct.emit(15)
 
-            # ---- Per-slice extractor ----------------------------------
-            # Standard czifile dim order (7-D): (S, T, C, Z, Y, X, A)
-            # For ndim < 7 trailing dims are dropped.
-            # We address from the END so the code works for any ndim >= 2.
-            #   ndim-1 = A (or X if 6-D), ndim-2 = X (or Y), ...
-            # For a 7-D array: C=ndim-5, Z=ndim-4, Y=ndim-3, X=ndim-2
-            def _raw_slice(c_idx: int, z_idx: int) -> np.ndarray:
-                idx: list = [0] * ndim
-                # Y and X are always the last spatial dims
-                y_ax = ndim - 3 if ndim >= 7 else ndim - 2
-                x_ax = ndim - 2 if ndim >= 7 else ndim - 1
-                idx[y_ax] = slice(None)
-                idx[x_ax] = slice(None)
-                if ndim >= 5:
-                    c_ax = ndim - 5
-                    idx[c_ax] = min(c_idx, raw_shape[c_ax] - 1)
-                if ndim >= 4:
-                    z_ax = ndim - 4
-                    idx[z_ax] = min(z_idx, raw_shape[z_ax] - 1)
-                return np.squeeze(data[tuple(idx)])  # type: ignore[index]
+            # ── Determine plane height/width from a sample read ──────────
+            if self._abort:
+                czi.close()
+                return
+            s0   = _select_plane(img, dims, channel_subset[0], 0)
+            H, W = int(s0.shape[0]), int(s0.shape[1])
 
-            # ---- Max-Z projection -------------------------------------
+            # ── Max-Z composite projection (fluorescence subset only) ────
             self.signals.progress.emit("Building max-Z projection…")
-            ch  = min(self.channel, n_c - 1)
-            s0  = _raw_slice(ch, 0)
-            H, W = int(s0.shape[-2]), int(s0.shape[-1])
-            proj = np.zeros((H, W), dtype=np.float32)
+            print(f"[Scope] Projection using channels: {channel_subset}")
+
+            composite_proj = np.zeros((H, W, 3), dtype=np.float32)
+
             for z in range(n_z):
                 if self._abort:
+                    czi.close()
                     return
-                sl = _raw_slice(ch, z).astype(np.float32)
-                h, w = sl.shape[-2], sl.shape[-1]
-                proj[:h, :w] = np.maximum(proj[:h, :w], sl[-H:, -W:])
-                self.signals.pct.emit(15 + int(80 * (z + 1) / n_z))
+                for i, raw_c in enumerate(channel_subset):
+                    sl     = _select_plane(img, dims, raw_c, z).astype(np.float32)
+                    f      = _norm_to_float(sl)
+                    info   = channel_info[raw_c]
+                    colour = _colour_for_channel(
+                        info.get("name", ""),
+                        info.get("color_hex", ""),
+                        i   # fallback palette index cycles over the 4-entry subset
+                    )
+                    composite_proj[:, :, 0] = np.maximum(composite_proj[:, :, 0], f * colour[0])
+                    composite_proj[:, :, 1] = np.maximum(composite_proj[:, :, 1], f * colour[1])
+                    composite_proj[:, :, 2] = np.maximum(composite_proj[:, :, 2], f * colour[2])
+                self.signals.pct.emit(15 + int(80 * (z + 1) / max(1, n_z)))
 
-            proj_u8 = _to_uint8(proj)
+            peak = composite_proj.max()
+            if peak > 0:
+                composite_proj /= peak
+            proj_u8 = (np.clip(composite_proj, 0, 1) * 255).astype(np.uint8)
             czi.close()
 
             self.signals.pct.emit(100)
             self.signals.finished.emit({
-                "path":       self.path,
-                "raw_shape":  raw_shape,
-                "ndim":       ndim,
-                "n_z":        n_z,
-                "n_c":        n_c,
-                "um_per_px":  um_per_px,
-                "projection": proj_u8,
-                "axes":       "",        # not used by new SliceReader
-                "shape":      raw_shape, # alias for compatibility
+                "path":           self.path,
+                "n_z":            n_z,
+                # The TRUE total channel count, so the rest of the app can
+                # address every channel:
+                "n_c":            n_c_pixel,
+                "um_per_px":      um_per_px,
+                "projection":     proj_u8,
+                "channel_info":   channel_info,   # length == n_c_pixel
+                "channel_subset": channel_subset, # e.g. [20, 21, 22, 23]
+                "scene_key":      scene_key,
+                "dims":           dims,
+                # Kept for backwards-compatibility with the rest of the app:
+                "axes":           "".join(dims),
+                "shape":          tuple(img.shape),
+                "raw_shape":      tuple(img.shape),
+                "ndim":           ndim,
             })
 
         except ImportError:
             self.signals.error.emit(
-                "czifile not installed.\n\nRun:\n  pip install czifile scikit-image"
+                "czifile not installed.\n\nRun:\n  pip install -U \"czifile[all]\" scikit-image"
             )
         except Exception:
             import traceback
             self.signals.error.emit(traceback.format_exc())
 
 
+# ---------------------------------------------------------------------------
+# SliceReader — keeps the CZI handle open for on-demand reads
+# ---------------------------------------------------------------------------
+
 class SliceReader:
     """
-    Keeps a czifile handle open for on-demand Z-slice reads.
-    Uses the same positional ndim-based indexing as CziLoader.
-    Call get_slice(z, channel) → processed uint8 (H, W).
+    On-demand Z-slice reader for the 2026 czifile API.
+
+    Reads are done by selecting absolute coordinates on the scene image:
+        img(C=c, Z=z).asarray()
+    so only the requested plane is pulled from disk (RAM ≈ one slice).
+
+    get_slice(z, channel)                          → uint8 (H,W)     grayscale
+    get_coloured_slice(z, subset_idx, info, subset)→ uint8 (H,W,3)   false-colour
+    get_composite_rgb(z, n_c, info, subset)        → uint8 (H,W,3)   composite
     """
 
-    def __init__(self, path: str, axes: str, shape: tuple):
+    def __init__(self, path: str, scene_key=None, dims=None):
         import czifile
-        self._czi   = czifile.CziFile(path)
-        self._data  = self._czi.asarray()
-        self._ndim  = self._data.ndim
-        self._shape = self._data.shape
+        self._czi = czifile.CziFile(path)
+
+        # A CZI file handle has an internal read position + decode cache and is
+        # NOT thread-safe.  The overview worker thread and the main GUI thread
+        # both read through this one reader, so every actual read of the handle
+        # must be serialised or the decompressor gets handed corrupted bytes
+        # (ZSTD "Unknown frame descriptor" / "Src size is incorrect").
+        self._lock = threading.Lock()
+
+        try:
+            keys = list(self._czi.scenes.keys())
+        except Exception:
+            keys = []
+
+        if scene_key is not None and scene_key in keys:
+            self._img = self._czi.scenes[scene_key]
+        elif keys:
+            self._img = self._czi.scenes[keys[0]]
+        else:
+            self._img = self._czi.scenes()
+
+        self._dims = tuple(dims) if dims else tuple(self._img.dims)
+        print(f"[SliceReader] dims={self._dims}  sizes={dict(self._img.sizes)}")
 
     def _raw_slice(self, c_idx: int, z_idx: int) -> np.ndarray:
-        ndim  = self._ndim
-        shape = self._shape
-        idx: list = [0] * ndim
-        y_ax = ndim - 3 if ndim >= 7 else ndim - 2
-        x_ax = ndim - 2 if ndim >= 7 else ndim - 1
-        idx[y_ax] = slice(None)
-        idx[x_ax] = slice(None)
-        if ndim >= 5:
-            c_ax = ndim - 5
-            idx[c_ax] = min(c_idx, shape[c_ax] - 1)
-        if ndim >= 4:
-            z_ax = ndim - 4
-            idx[z_ax] = min(z_idx, shape[z_ax] - 1)
-        return np.squeeze(self._data[tuple(idx)])
+        """Return squeezed 2-D (Y, X) array for one absolute channel + Z.
+
+        Guarded by the instance lock so concurrent reads from the overview
+        worker and the GUI thread can never corrupt the shared file handle.
+        """
+        with self._lock:
+            return _select_plane(self._img, self._dims, c_idx, z_idx)
 
     def get_slice(self, z: int, channel: int) -> np.ndarray:
-        raw = self._raw_slice(channel, z)
-        return _process_slice(raw)
+        """Grayscale processed uint8 (H, W).  `channel` is an absolute index."""
+        return _process_slice(self._raw_slice(channel, z))
 
-    def get_composite_rgb(self, z: int, n_c: int) -> np.ndarray:
-        channels = []
-        for c in range(min(n_c, 3)):
-            channels.append(self._raw_slice(c, z).astype(np.float32))
-        # Normalize each channel independently
-        H, W = channels[0].shape[-2], channels[0].shape[-1]
-        rgb = np.zeros((H, W, 3), dtype=np.float32)
-        for i, ch in enumerate(channels):
-            a = ch.astype(np.float32)
-            lo, hi = a.min(), a.max()
-            if hi > lo:
-                a = (a - lo) / (hi - lo)
-            rgb[:, :, i] = a
+    def get_coloured_slice(self, z: int, subset_idx: int,
+                           channel_info: list,
+                           channel_subset: list | None = None) -> np.ndarray:
+        """
+        Single-channel false-colour RGB (H, W, 3) uint8.
+        subset_idx is an index into channel_subset (0 = first fluorescence channel).
+        channel_subset maps subset_idx → absolute channel index (e.g. 20..23).
+        """
+        raw_ch = channel_subset[subset_idx] if channel_subset is not None else subset_idx
+        raw    = self._raw_slice(raw_ch, z)
+        f      = _norm_to_float(raw)
+        info   = channel_info[raw_ch] if raw_ch < len(channel_info) else {}
+        colour = _colour_for_channel(
+            info.get("name", ""),
+            info.get("color_hex", ""),
+            raw_ch  # fallback palette index
+        )
+        rgb = np.stack([f * colour[0], f * colour[1], f * colour[2]], axis=-1)
         return (np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+
+    def get_composite_rgb(self, z: int, n_c: int,
+                          channel_info: list,
+                          channel_subset: list | None = None) -> np.ndarray:
+        """
+        Additive max-brightness composite → RGB uint8 (H, W, 3).
+        channel_subset: absolute channel indices to blend; None = all n_c channels.
+        """
+        channels_to_use = channel_subset if channel_subset is not None else list(range(n_c))
+
+        s0   = self._raw_slice(channels_to_use[0], z)
+        H, W = s0.shape[0], s0.shape[1]
+        comp = np.zeros((H, W, 3), dtype=np.float32)
+
+        for i, raw_c in enumerate(channels_to_use):
+            raw    = self._raw_slice(raw_c, z).astype(np.float32)
+            f      = _norm_to_float(raw)
+            info   = channel_info[raw_c] if raw_c < len(channel_info) else {}
+            colour = _colour_for_channel(
+                info.get("name", ""),
+                info.get("color_hex", ""),
+                i   # cycles over the subset for the fallback palette
+            )
+            comp[:, :, 0] += f * colour[0]
+            comp[:, :, 1] += f * colour[1]
+            comp[:, :, 2] += f * colour[2]
+
+        peak = comp.max()
+        if peak > 0:
+            comp /= peak
+        return (np.clip(comp, 0, 1) * 255).astype(np.uint8)
 
     def close(self):
         self._czi.close()
+
+
+# ---------------------------------------------------------------------------
+# Colour helper
+# ---------------------------------------------------------------------------
+
+def _hex_to_rgb_float(hex_str: str) -> list:
+    try:
+        h = hex_str.lstrip("#")
+        if len(h) == 8:
+            r = int(h[2:4], 16) / 255.0
+            g = int(h[4:6], 16) / 255.0
+            b = int(h[6:8], 16) / 255.0
+        elif len(h) == 6:
+            r = int(h[0:2], 16) / 255.0
+            g = int(h[2:4], 16) / 255.0
+            b = int(h[4:6], 16) / 255.0
+        else:
+            return None  # type: ignore[return-value]
+        if r == 0.0 and g == 0.0 and b == 0.0:
+            return None  # type: ignore[return-value]
+        return [r, g, b]
+    except Exception:
+        return None  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -312,16 +524,15 @@ class ImageCanvas(FigureCanvas):
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        self._markers: list = []
-        self._mode = MODE_NORMAL
-
-        self._press_xy   = None
-        self._rect_patch = None
+        self._markers: list   = []
+        self._mode            = MODE_NORMAL
+        self._press_xy        = None
+        self._rect_patch      = None
         self._lasso_xy: list  = []
-        self._lasso_line = None
-        self._pan_start  = None
-        self._xlim_start = None
-        self._ylim_start = None
+        self._lasso_line      = None
+        self._pan_start       = None
+        self._xlim_start      = None
+        self._ylim_start      = None
 
         self.mpl_connect("button_press_event",   self._on_press)
         self.mpl_connect("motion_notify_event",  self._on_motion)
@@ -336,12 +547,33 @@ class ImageCanvas(FigureCanvas):
         }
         self.setCursor(cur.get(mode, Qt.CursorShape.ArrowCursor))
 
-    def show_image(self, image_array):
+    def show_image(self, image_array, preserve_view: bool = False):
+        if preserve_view:
+            saved_xlim = self.ax.get_xlim()
+            saved_ylim = self.ax.get_ylim()
         self.ax.cla()
         self.ax.axis("off")
         if image_array is not None:
-            self.ax.imshow(image_array, cmap="gray", interpolation="nearest")
+            if image_array.ndim == 3:
+                self.ax.imshow(image_array, interpolation="nearest")
+            else:
+                self.ax.imshow(image_array, cmap="gray", interpolation="nearest",
+                               vmin=0, vmax=255)
         self._draw_markers()
+        if preserve_view:
+            self.ax.set_xlim(saved_xlim)  # type: ignore
+            self.ax.set_ylim(saved_ylim)  # type: ignore
+        self.fig.canvas.draw_idle()
+
+    def zoom(self, factor: float):
+        xlim = self.ax.get_xlim()
+        ylim = self.ax.get_ylim()
+        xc = (xlim[0] + xlim[1]) / 2
+        yc = (ylim[0] + ylim[1]) / 2
+        self.ax.set_xlim(xc - (xlim[1]-xlim[0]) / 2 / factor,
+                         xc + (xlim[1]-xlim[0]) / 2 / factor)
+        self.ax.set_ylim(yc - (ylim[1]-ylim[0]) / 2 / factor,
+                         yc + (ylim[1]-ylim[0]) / 2 / factor)
         self.fig.canvas.draw_idle()
 
     def set_markers(self, markers: list):
@@ -395,7 +627,7 @@ class ImageCanvas(FigureCanvas):
             self.ax.add_patch(self._rect_patch)
 
         elif self._mode == MODE_DELETE:
-            self._lasso_xy = [(event.xdata, event.ydata)]
+            self._lasso_xy   = [(event.xdata, event.ydata)]
             self._lasso_line, = self.ax.plot(
                 [event.xdata], [event.ydata],
                 color="#ff4444", linewidth=1.5, zorder=10
@@ -404,7 +636,10 @@ class ImageCanvas(FigureCanvas):
     def _on_motion(self, event):
         if event.inaxes != self.ax or event.xdata is None or self._press_xy is None:
             return
-        if self._mode == MODE_NORMAL and self._pan_start and self._xlim_start and self._ylim_start is not None:
+        if (self._mode == MODE_NORMAL
+                and self._pan_start is not None
+                and self._xlim_start is not None
+                and self._ylim_start is not None):
             dx = event.xdata - self._pan_start[0]
             dy = event.ydata - self._pan_start[1]
             self.ax.set_xlim(self._xlim_start[0] - dx, self._xlim_start[1] - dx)
@@ -480,14 +715,19 @@ class ZSliceCanvas(FigureCanvas):
         self.mpl_connect("motion_notify_event",  self._on_motion)
         self.mpl_connect("button_release_event", self._on_release)
 
-    def show_slice(self, slice_array, cell_mask=None, cilia_mask=None):
+    def show_slice(self, slice_array, cell_mask=None, cilia_mask=None,
+                   preserve_view: bool = False):
+        if preserve_view:
+            saved_xlim = self.ax.get_xlim()
+            saved_ylim = self.ax.get_ylim()
         self.ax.cla()
         self.ax.axis("off")
         if slice_array is not None:
             if slice_array.ndim == 3:
                 self.ax.imshow(slice_array, interpolation="nearest")
             else:
-                self.ax.imshow(slice_array, cmap="gray", interpolation="nearest")
+                self.ax.imshow(slice_array, cmap="gray", interpolation="nearest",
+                               vmin=0, vmax=255)
         if cell_mask is not None:
             ov = np.zeros((*cell_mask.shape, 4))
             ov[cell_mask > 0] = [0.1, 0.4, 0.9, 0.35]
@@ -496,6 +736,9 @@ class ZSliceCanvas(FigureCanvas):
             ov = np.zeros((*cilia_mask.shape, 4))
             ov[cilia_mask > 0] = [0.9, 0.1, 0.6, 0.6]
             self.ax.imshow(ov, interpolation="nearest")
+        if preserve_view:
+            self.ax.set_xlim(saved_xlim)  # type: ignore
+            self.ax.set_ylim(saved_ylim)  # type: ignore
         self.fig.canvas.draw_idle()
 
     def set_measure_mode(self, enabled: bool):
@@ -559,7 +802,10 @@ class ZSliceCanvas(FigureCanvas):
                 [p[1] for p in self._freehand_xy]
             )
             self.fig.canvas.draw_idle()
-        elif not self._measure_mode and self._pan_start and self._xlim_start and self._ylim_start is not None:
+        elif (not self._measure_mode
+              and self._pan_start is not None
+              and self._xlim_start is not None
+              and self._ylim_start is not None):
             dx = event.xdata - self._pan_start[0]
             dy = event.ydata - self._pan_start[1]
             self.ax.set_xlim(self._xlim_start[0] - dx, self._xlim_start[1] - dx)
@@ -597,8 +843,7 @@ class ZSliceCanvas(FigureCanvas):
 # ---------------------------------------------------------------------------
 
 class OverviewPanel(QWidget):
-    # Emitted after a file is successfully loaded
-    file_loaded = pyqtSignal(dict)   # payload = CziData dict from CziLoader
+    file_loaded = pyqtSignal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -606,7 +851,6 @@ class OverviewPanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # Header row
         header = QHBoxLayout()
         self.title_lbl = QLabel("Z-Projection (max intensity)")
         self.title_lbl.setFont(QFont("Courier New", 9))
@@ -622,16 +866,27 @@ class OverviewPanel(QWidget):
             QPushButton:hover   { background: #3a3a3a; border-color: #00aaff; }
             QPushButton:checked { background: #00aaff; color: #000; border-color: #00aaff; }
         """
-        self.btn_plus  = QPushButton("+")
-        self.btn_minus = QPushButton("−")
+        self.btn_plus    = QPushButton("+")
+        self.btn_minus   = QPushButton("−")
+        self.btn_zoomin  = QPushButton("🔍+")
+        self.btn_zoomout = QPushButton("🔍−")
         for btn in (self.btn_plus, self.btn_minus):
             btn.setFixedSize(28, 28)
             btn.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
             btn.setCheckable(True)
             btn.setStyleSheet(btn_style)
             btn.setEnabled(False)
+        for btn in (self.btn_zoomin, self.btn_zoomout):
+            btn.setFixedSize(40, 28)
+            btn.setFont(QFont("Courier New", 9))
+            btn.setStyleSheet(btn_style)
+            btn.setEnabled(False)
         self.btn_plus.clicked.connect(self._on_plus)
         self.btn_minus.clicked.connect(self._on_minus)
+        self.btn_zoomin.clicked.connect(lambda: self.canvas.zoom(1.3))
+        self.btn_zoomout.clicked.connect(lambda: self.canvas.zoom(1 / 1.3))
+        header.addWidget(self.btn_zoomout)
+        header.addWidget(self.btn_zoomin)
         header.addWidget(self.btn_plus)
         header.addWidget(self.btn_minus)
         layout.addLayout(header)
@@ -644,12 +899,11 @@ class OverviewPanel(QWidget):
         self.status_lbl.setStyleSheet("color: #666;")
         layout.addWidget(self.status_lbl)
 
-        self._open_cid  = None
-        self._loader    = None
-        self._progress  = None
+        self._open_cid = None
+        self._loader   = None
+        self._progress = None
         self._show_open_prompt()
 
-    # ------------------------------------------------------------------
     def _show_open_prompt(self):
         ax = self.canvas.ax
         ax.cla()
@@ -688,12 +942,10 @@ class OverviewPanel(QWidget):
             self._show_open_prompt()
             return
 
-        # Kill any previous loader
         if self._loader is not None:
             self._loader.abort()
             self._loader.wait()
 
-        # Progress dialog (modal)
         self._progress = QProgressDialog("Opening CZI file…", "Cancel", 0, 100, self)
         self._progress.setWindowTitle("Loading")
         self._progress.setWindowModality(Qt.WindowModality.WindowModal)
@@ -701,7 +953,7 @@ class OverviewPanel(QWidget):
         self._progress.setValue(0)
 
         self._loader = CziLoader(path, channel=0)
-        progress = self._progress
+        progress     = self._progress
         self._loader.signals.progress.connect(
             lambda msg: progress.setLabelText(msg) if progress is not None else None
         )
@@ -719,7 +971,6 @@ class OverviewPanel(QWidget):
         proj  = czi_data["projection"]
 
         self.canvas.show_image(proj)
-        # Reset any pan bleed-through
         self.canvas._pan_start  = None
         self.canvas._xlim_start = None
         self.canvas._ylim_start = None
@@ -734,18 +985,17 @@ class OverviewPanel(QWidget):
         self.status_lbl.setText("File loaded — run detection to populate cells")
         self.btn_plus.setEnabled(True)
         self.btn_minus.setEnabled(True)
-
+        self.btn_zoomin.setEnabled(True)
+        self.btn_zoomout.setEnabled(True)
         self.file_loaded.emit(czi_data)
 
     @pyqtSlot(str)
     def _on_load_error(self, msg: str):
         if self._progress:
             self._progress.close()
-        from PyQt6.QtWidgets import QMessageBox
         QMessageBox.critical(self, "CZI Load Error", msg)
         self._show_open_prompt()
 
-    # ------------------------------------------------------------------
     def _on_plus(self, checked: bool):
         if checked:
             self.btn_minus.setChecked(False)
@@ -776,9 +1026,8 @@ class OverviewPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class ZViewerPanel(QWidget):
-    measure_toggled   = pyqtSignal(bool)
-    z_changed         = pyqtSignal(int)      # emitted when slider moves
-    channel_changed   = pyqtSignal(int)      # emitted when channel combo changes
+    measure_toggled = pyqtSignal(bool)
+    z_changed       = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -786,7 +1035,6 @@ class ZViewerPanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        # Tool buttons (left strip)
         tool_col = QVBoxLayout()
         tool_col.setSpacing(4)
         tool_col.addStretch()
@@ -817,38 +1065,12 @@ class ZViewerPanel(QWidget):
             btn.setStyleSheet(btn_style)
             tool_col.addWidget(btn)
 
-        # Channel selector
-        self.ch_label = QLabel("Ch")
-        self.ch_label.setFont(QFont("Courier New", 7))
-        self.ch_label.setStyleSheet("color: #666;")
-        self.ch_label.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        self.ch_combo = QComboBox()
-        self.ch_combo.addItem("RGB")
-        self.ch_combo.setFont(QFont("Courier New", 8))
-        self.ch_combo.setStyleSheet("""
-            QComboBox {
-                background: #2a2a2a; color: #e0e0e0;
-                border: 1px solid #444; border-radius: 3px;
-                padding: 2px 4px; min-width: 48px;
-            }
-            QComboBox QAbstractItemView {
-                background: #2a2a2a; color: #e0e0e0;
-                selection-background-color: #003355;
-            }
-        """)
-        self.ch_combo.currentIndexChanged.connect(
-            lambda idx: self.channel_changed.emit(idx)
-        )
-        tool_col.addWidget(self.ch_label)
-        tool_col.addWidget(self.ch_combo)
         tool_col.addStretch()
         layout.addLayout(tool_col)
 
-        # Canvas
         self.canvas = ZSliceCanvas(self)
         layout.addWidget(self.canvas, stretch=1)
 
-        # Z-slider (right strip)
         slider_col = QVBoxLayout()
         slider_col.setSpacing(2)
         z_top = QLabel("Z")
@@ -896,20 +1118,10 @@ class ZViewerPanel(QWidget):
         self.z_val.setText(str(value))
         self.z_changed.emit(value)
 
-    def configure(self, n_z: int, n_c: int):
-        """Called after a file loads to set slider range and channel options."""
+    def configure(self, n_z: int):
         self.z_slider.setMaximum(max(0, n_z - 1))
         self.z_slider.setValue(n_z // 2)
         self.z_slider.setTickInterval(max(1, n_z // 10))
-
-        # Rebuild channel combo
-        self.ch_combo.blockSignals(True)
-        self.ch_combo.clear()
-        self.ch_combo.addItem("RGB (composite)")
-        for c in range(n_c):
-            self.ch_combo.addItem(f"Ch {c}")
-        self.ch_combo.blockSignals(False)
-        self.ch_combo.setCurrentIndex(0)
 
     def _load_placeholder(self):
         self.canvas.ax.cla()
@@ -1026,18 +1238,27 @@ class DataTablePanel(QWidget):
 
 class ScopeWindow(QMainWindow):
 
+    _overview_ready = pyqtSignal(object, bool)   # (proj_uint8, preserve_view)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Scope")
         self.setMinimumSize(1280, 800)
 
-        self._markers: list    = []
+        self._markers: list     = []
         self._current_file: str = ""
-        self._czi_data: dict   = {}
+        self._czi_data: dict    = {}
         self._slice_reader: SliceReader | None = None
+        self._current_channel: int = 0   # 0 = composite RGB, 1..N = subset index 0..N-1
+        self._channel_subset: list = []  # absolute channel indices (e.g. [20,21,22,23])
+        self._overview_worker = None
+
+        self.overview_panel = OverviewPanel()
+        self.zviewer_panel  = ZViewerPanel()
 
         self._apply_theme()
         self._build_layout()
+        self._overview_ready.connect(self._on_overview_ready)
 
     def _apply_theme(self):
         self.setStyleSheet("""
@@ -1055,17 +1276,31 @@ class ScopeWindow(QMainWindow):
         """)
 
     def _build_layout(self):
-        v_split = QSplitter(Qt.Orientation.Vertical)
+        menubar = self.menuBar()
+        if menubar is None:
+            print("menubar failed to load properly")
+            return
+        file_menu = menubar.addMenu("File")
+        open_act  = QAction("Open .czi…", self)
+        open_act.setShortcut("Ctrl+O")
+        open_act.triggered.connect(self.overview_panel.open_file)
+        if file_menu is None:
+            print("file_menu not loading properly")
+            return
+        file_menu.addAction(open_act)
 
-        h_top = QSplitter(Qt.Orientation.Horizontal)
-        self.overview_panel = OverviewPanel()
-        self.zviewer_panel  = ZViewerPanel()
+        self._channel_menu  = menubar.addMenu("Channel")
+        self._channel_group = QActionGroup(self)
+        self._channel_group.setExclusive(True)
+        self._rebuild_channel_menu([])
+
+        v_split = QSplitter(Qt.Orientation.Vertical)
+        h_top   = QSplitter(Qt.Orientation.Horizontal)
         h_top.addWidget(self._framed(self.overview_panel))
         h_top.addWidget(self._framed(self.zviewer_panel))
         h_top.setSizes([550, 550])
 
         self.table_panel = DataTablePanel()
-
         v_split.addWidget(h_top)
         v_split.addWidget(self._framed(self.table_panel))
         v_split.setSizes([520, 280])
@@ -1075,7 +1310,6 @@ class ScopeWindow(QMainWindow):
         self.setStatusBar(self.status)
         self.status.showMessage("Scope — open a .czi file to begin")
 
-        # Signals
         self.overview_panel.canvas.cell_clicked.connect(self._on_cell_clicked)
         self.overview_panel.canvas.marker_added.connect(self._on_marker_added)
         self.overview_panel.canvas.markers_deleted.connect(self._on_markers_deleted)
@@ -1089,7 +1323,132 @@ class ScopeWindow(QMainWindow):
             )
         )
         self.zviewer_panel.z_changed.connect(self._on_z_changed)
-        self.zviewer_panel.channel_changed.connect(self._on_channel_changed)
+
+    def _rebuild_channel_menu(self, channel_info: list, raw_indices: list | None = None):
+        """
+        Rebuild the Channel menu from the fluorescence subset.
+        channel_info: metadata for the subset channels only.
+        raw_indices:  the real absolute indices (e.g. [20,21,22,23]) — used in labels.
+        """
+        if self._channel_menu is None:
+            return
+        self._channel_menu.clear()
+        for act in self._channel_group.actions():
+            self._channel_group.removeAction(act)
+
+        def _make_action(label: str, idx: int):
+            act = QAction(label, self)
+            act.setCheckable(True)
+            act.setChecked(idx == 0)
+            act.triggered.connect(lambda checked, i=idx: self._on_channel_selected(i))
+            self._channel_group.addAction(act)
+            if self._channel_menu is None:
+                print("self._channel_menu failed to load properly")
+                return
+            self._channel_menu.addAction(act)
+
+        _make_action("RGB (composite)", 0)
+        self._channel_menu.addSeparator()
+        for i, ch in enumerate(channel_info):
+            name    = ch.get("name", "") or ""
+            raw_idx = raw_indices[i] if raw_indices is not None else i
+            # Show the true absolute index (e.g. "Ch 20: AF647-T1")
+            label   = f"Ch {raw_idx}: {name}" if name else f"Ch {raw_idx}"
+            _make_action(label, i + 1)
+
+    def _on_channel_selected(self, combo_idx: int):
+        self._current_channel = combo_idx
+        z = self.zviewer_panel.z_slider.value()
+        self._display_z_slice(z)
+        self._update_overview(preserve_view=True)
+
+    # ------------------------------------------------------------------
+    # Overview projection
+    # ------------------------------------------------------------------
+
+    def _update_overview(self, preserve_view: bool = False):
+        if self._slice_reader is None:
+            return
+
+        if hasattr(self, "_overview_worker") and self._overview_worker is not None:
+            try:
+                self._overview_worker.cancel()
+                self._overview_worker.done.disconnect()
+                self._overview_worker.quit()
+                self._overview_worker.wait(300)
+            except RuntimeError:
+                pass
+            self._overview_worker = None
+
+        n_c          = self._czi_data.get("n_c", 1)
+        n_z          = self._czi_data.get("n_z", 1)
+        channel_info = self._czi_data.get("channel_info", [])
+        subset       = self._channel_subset if self._channel_subset else list(range(n_c))
+        combo_idx    = self._current_channel
+        reader       = self._slice_reader
+
+        class _OverviewWorker(QThread):
+            done = pyqtSignal(object, bool)
+
+            def __init__(self, reader, combo_idx, n_c, n_z,
+                         channel_info, subset, preserve_view):
+                super().__init__()
+                self._reader       = reader
+                self._combo_idx    = combo_idx
+                self._n_c          = n_c
+                self._n_z          = n_z
+                self._channel_info = channel_info
+                self._subset       = subset
+                self._preserve     = preserve_view
+                self._cancelled    = False
+
+            def cancel(self):
+                self._cancelled = True
+
+            def run(self):
+                try:
+                    if self._combo_idx == 0:
+                        s0   = self._reader.get_composite_rgb(
+                            0, self._n_c, self._channel_info,
+                            channel_subset=self._subset)
+                        H, W = s0.shape[0], s0.shape[1]
+                        proj = np.zeros((H, W, 3), dtype=np.float32)
+                        for z in range(self._n_z):
+                            if self._cancelled:
+                                return
+                            frame = self._reader.get_composite_rgb(
+                                z, self._n_c, self._channel_info,
+                                channel_subset=self._subset
+                            ).astype(np.float32)
+                            proj = np.maximum(proj, frame)
+                        proj_u8 = np.clip(proj, 0, 255).astype(np.uint8)
+                    else:
+                        s0   = self._reader.get_coloured_slice(
+                            0, self._combo_idx - 1, self._channel_info,
+                            channel_subset=self._subset)
+                        H, W = s0.shape[0], s0.shape[1]
+                        proj = np.zeros((H, W, 3), dtype=np.float32)
+                        for z in range(self._n_z):
+                            if self._cancelled:
+                                return
+                            frame = self._reader.get_coloured_slice(
+                                z, self._combo_idx - 1, self._channel_info,
+                                channel_subset=self._subset
+                            ).astype(np.float32)
+                            proj = np.maximum(proj, frame)
+                        proj_u8 = np.clip(proj, 0, 255).astype(np.uint8)
+
+                    if not self._cancelled:
+                        self.done.emit(proj_u8, self._preserve)
+                except Exception as e:
+                    print(f"[Scope] Overview update error: {e}")
+
+        worker = _OverviewWorker(reader, combo_idx, n_c, n_z,
+                                 channel_info, subset, preserve_view)
+        worker.done.connect(self._on_overview_ready)
+        worker.finished.connect(worker.deleteLater)
+        self._overview_worker = worker
+        worker.start()
 
     def _framed(self, widget: QWidget) -> QFrame:
         frame = QFrame()
@@ -1106,73 +1465,104 @@ class ScopeWindow(QMainWindow):
 
     @pyqtSlot(object)
     def _on_file_loaded(self, czi_data: dict):
-        self._czi_data    = czi_data
+        self._czi_data     = czi_data
         self._current_file = os.path.basename(czi_data["path"])
 
-        # Close previous reader if any
         if self._slice_reader is not None:
             try:
                 self._slice_reader.close()
             except Exception:
                 pass
 
-        # Open a persistent slice reader for on-demand Z access
         self._slice_reader = SliceReader(
             czi_data["path"],
-            czi_data["axes"],
-            czi_data["shape"]
+            scene_key=czi_data.get("scene_key"),
+            dims=czi_data.get("dims"),
         )
 
-        # Configure the Z-slider and channel combo
-        self.zviewer_panel.configure(czi_data["n_z"], czi_data["n_c"])
+        # Use the channel_subset emitted by CziLoader directly — it is the
+        # last 4 of the TRUE channel count (e.g. [20, 21, 22, 23]).
+        self._channel_subset = czi_data.get("channel_subset", [])
+        print(f"[Scope] _on_file_loaded: using channel_subset = {self._channel_subset}")
 
-        # Show the middle Z slice immediately
+        self.zviewer_panel.configure(czi_data["n_z"])
+        self._current_channel = 0
+
+        # Build the Channel menu using the metadata for the subset channels only
+        full_info = czi_data.get("channel_info", [])
+        subset_info = [
+            full_info[c] if c < len(full_info) else {"name": f"Ch{c}", "color_hex": ""}
+            for c in self._channel_subset
+        ]
+        self._rebuild_channel_menu(subset_info, self._channel_subset)
+
         mid_z = czi_data["n_z"] // 2
-        self._display_z_slice(mid_z, channel_idx=0)
+        self._display_z_slice(mid_z, force_channel=0, preserve_view=False)
+        # Show the static projection from CziLoader immediately, then
+        # kick off the live overview (same channels, better normalisation).
+        self.overview_panel.canvas.show_image(czi_data["projection"], preserve_view=False)
+        self._update_overview(preserve_view=False)
 
         self.status.showMessage(
             f"Loaded: {self._current_file}  |  "
-            f"Z={czi_data['n_z']}  C={czi_data['n_c']}  "
+            f"Z={czi_data['n_z']}  C_total={czi_data['n_c']}  "
+            f"fluorescence={self._channel_subset}  "
             f"|  {czi_data['um_per_px']:.4f} µm/px  |  "
             "Use Z-slider (right panel) to scroll Z layers"
         )
 
     # ------------------------------------------------------------------
-    # Z / channel navigation
+    # Z / channel display
     # ------------------------------------------------------------------
 
-    def _current_channel(self) -> int:
-        """0 = composite RGB, 1..N = channel index 0..N-1"""
-        return self.zviewer_panel.ch_combo.currentIndex()
-
-    def _display_z_slice(self, z: int, channel_idx: int = -1):
+    def _display_z_slice(self, z: int, force_channel: int = -1,
+                         preserve_view: bool = True):
         if self._slice_reader is None:
             return
-        n_c = self._czi_data.get("n_c", 1)
-        ch  = self._current_channel() if channel_idx == -1 else channel_idx
 
-        if ch == 0 or n_c == 1:
-            # Composite RGB
-            img = self._slice_reader.get_composite_rgb(z, n_c)
+        n_c          = self._czi_data.get("n_c", 1)
+        channel_info = self._czi_data.get("channel_info", [])
+        subset       = self._channel_subset if self._channel_subset else list(range(n_c))
+        combo_idx    = self._current_channel if force_channel == -1 else force_channel
+
+        if combo_idx == 0:
+            try:
+                img = self._slice_reader.get_composite_rgb(
+                    z, n_c, channel_info, channel_subset=subset)
+            except Exception as e:
+                print(f"[Scope] Z-slice read error (composite, z={z}): {e}")
+                self.status.showMessage(f"Could not read Z={z} (composite): {e}")
+                return
         else:
-            # Single channel (combo index 1 → channel 0, etc.)
-            img = self._slice_reader.get_slice(z, ch - 1)
+            try:
+                img = self._slice_reader.get_coloured_slice(
+                    z, combo_idx - 1, channel_info, channel_subset=subset)
+            except Exception as e:
+                print(f"[Scope] Z-slice read error (channel, z={z}): {e}")
+                self.status.showMessage(f"Could not read Z={z}: {e}")
+                return
 
-        self.zviewer_panel.canvas.show_slice(img)
+        self.zviewer_panel.canvas.show_slice(img, preserve_view=preserve_view)
 
-        um = self._czi_data.get("um_per_px", 1.0)
+        um  = self._czi_data.get("um_per_px", 1.0)
+        n_z = self._czi_data.get("n_z", 1)
+        if combo_idx == 0:
+            ch_label = "RGB"
+        else:
+            raw_idx  = subset[combo_idx - 1] if combo_idx - 1 < len(subset) else combo_idx - 1
+            ch_label = (channel_info[raw_idx].get("name", "") or f"Ch {raw_idx}") \
+                if raw_idx < len(channel_info) else f"Ch {raw_idx}"
         self.status.showMessage(
-            f"{self._current_file}  |  Z = {z} / {self._czi_data.get('n_z', 1) - 1}  "
-            f"|  {um:.4f} µm/px"
+            f"{self._current_file}  |  Z = {z} / {n_z - 1}  "
+            f"|  channel: {ch_label}  |  {um:.4f} µm/px"
         )
+
+    @pyqtSlot(object, bool)
+    def _on_overview_ready(self, proj_u8: np.ndarray, preserve_view: bool):
+        self.overview_panel.canvas.show_image(proj_u8, preserve_view=preserve_view)
 
     @pyqtSlot(int)
     def _on_z_changed(self, z: int):
-        self._display_z_slice(z)
-
-    @pyqtSlot(int)
-    def _on_channel_changed(self, _: int):
-        z = self.zviewer_panel.z_slider.value()
         self._display_z_slice(z)
 
     # ------------------------------------------------------------------
@@ -1217,7 +1607,7 @@ class ScopeWindow(QMainWindow):
         length_um = length_px * um_per_px
         selected = self.table_panel.table.selectedItems()
         if selected:
-            row = self.table_panel.table.currentRow()
+            row  = self.table_panel.table.currentRow()
             item = QTableWidgetItem(f"{length_um:.2f} µm")
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table_panel.table.setItem(row, 5, item)
@@ -1229,7 +1619,7 @@ class ScopeWindow(QMainWindow):
         n = sum(1 for m in self._markers if m["accepted"])
         self.overview_panel.status_lbl.setText(f"{n} cells")
 
-    def closeEvent(self, a0: object) -> None:  # matches QWidget.closeEvent(self, a0)
+    def closeEvent(self, a0: object) -> None:
         if self._slice_reader is not None:
             try:
                 self._slice_reader.close()
