@@ -133,14 +133,20 @@ class CellResult:
 
 @dataclass
 class PackedCrop:
-    """Boolean 3-D sub-volume stored as packed bits (8× smaller than bool)."""
-    bits:  np.ndarray
-    shape: tuple
+    """Boolean 3-D sub-volume stored as packed bits (8× smaller than bool).
+
+    `slices` is the (z, y, x) slice triple locating this crop inside the full
+    volume, so a measured cilium can be painted back into an output mask.
+    """
+    bits:   np.ndarray
+    shape:  tuple
+    slices: tuple = ()
 
     @staticmethod
-    def from_crop(crop_bool: np.ndarray) -> "PackedCrop":
+    def from_crop(crop_bool: np.ndarray, slices=()) -> "PackedCrop":
         crop = np.ascontiguousarray(crop_bool, dtype=bool)
-        return PackedCrop(bits=np.packbits(crop), shape=crop.shape)
+        return PackedCrop(bits=np.packbits(crop), shape=crop.shape,
+                          slices=tuple(slices))
 
     def unpack(self) -> np.ndarray:
         n = int(np.prod(self.shape))
@@ -169,7 +175,6 @@ def _ones3():
 def _threshold_volume(vol: np.ndarray, p: DetectionParams,
                       min_size: int = 0) -> np.ndarray:
     from skimage.filters import threshold_otsu
-    from skimage.morphology import remove_small_objects
     try:
         t = float(threshold_otsu(vol))
     except Exception:
@@ -177,7 +182,14 @@ def _threshold_volume(vol: np.ndarray, p: DetectionParams,
     t = max(t, p.min_threshold)
     m = vol > t
     if min_size > 1 and m.any():
-        m = remove_small_objects(m, min_size=min_size)
+        # Drop tiny components (avoids skimage's deprecated remove_small_objects
+        # arg and stays correct across versions). 26-connectivity, like the rest.
+        lbl, n = _label(m, _ones3())
+        if n:
+            sizes = np.bincount(lbl.ravel())
+            keep = sizes >= min_size
+            keep[0] = False
+            m = keep[lbl] # type: ignore
     return m
 
 
@@ -208,10 +220,17 @@ def _skeleton_geodesic_um(mask: np.ndarray, spacing) -> float:
 
     sk = skeletonize(mask)
     pts = list(zip(*np.nonzero(sk)))
-    if len(pts) <= 1:
-        return 0.0
-
     sz, sy, sx = spacing
+    if len(pts) <= 1:
+        # Skeleton collapsed (short / thin / near-2-D cilium). Fall back to the
+        # physical bounding-box diagonal of the mask so a real cilium still gets
+        # a non-zero recorded length instead of being dropped.
+        mp = np.argwhere(mask)
+        if mp.shape[0] <= 1:
+            return 0.0
+        coords = mp.astype(np.float64) * np.asarray([sz, sy, sx])
+        return float(np.linalg.norm(coords.max(axis=0) - coords.min(axis=0)))
+
     if len(pts) > 40000:                         # guard against blob-like noise
         arr = np.asarray(pts, dtype=np.float64) * np.asarray([sz, sy, sx])
         return float(np.linalg.norm(arr.max(axis=0) - arr.min(axis=0)))
@@ -301,7 +320,15 @@ def build_3d_model(volumes, p):
     nuc2 = _threshold_volume(volumes["nuc2"], p, min_size=p.cilia_min_voxels)
     soma = _threshold_volume(volumes["gad"],  p, min_size=p.cilia_min_voxels)
     cilia = _threshold_volume(volumes["cilia"], p, min_size=p.cilia_min_voxels)
-    nucleus = (nuc1 & nuc2) if p.nucleus_combine == "and" else (nuc1 | nuc2)
+    mode = (p.nucleus_combine or "and").lower()
+    if mode == "or":
+        nucleus = nuc1 | nuc2
+    elif mode == "nuc1":
+        nucleus = nuc1
+    elif mode == "nuc2":
+        nucleus = nuc2
+    else:                       # "and" (default)
+        nucleus = nuc1 & nuc2
     return {"nucleus": nucleus, "soma": soma, "cilia": cilia}
 
 
@@ -443,7 +470,7 @@ def group_cell_parts(nuc_labels, soma_mask, cilia_mask, p, progress=None):
         if sl is None:
             continue
         crop = (cil_labels[sl] == lab)
-        cells[int(nn[li])]["cilia"].append(PackedCrop.from_crop(crop))
+        cells[int(nn[li])]["cilia"].append(PackedCrop.from_crop(crop, sl))
 
     return cells
 
@@ -458,10 +485,17 @@ def measure_cilia_lengths(groups, p, progress=None):
         if progress and (k - 1) % step == 0:
             progress((k - 1) / total, f"cell {k}/{total}")
         best_um = 0.0
+        best_packed = None
         for packed in cell["cilia"]:
             crop_bool = packed.unpack()
-            best_um = max(best_um, _skeleton_geodesic_um(crop_bool, spacing))
+            length = _skeleton_geodesic_um(crop_bool, spacing)
+            if length > best_um:
+                best_um = length
+                best_packed = packed
             del crop_bool
+        # The recorded length is this cell's longest cilium; remember which one
+        # so the saved image can keep only cilia whose length was recorded.
+        cell["best_cilium"] = best_packed if best_um > 0.0 else None
         cz, cy, cx = cell["centroid"]
         results.append(CellResult(
             num=cell["num"],
@@ -474,33 +508,69 @@ def measure_cilia_lengths(groups, p, progress=None):
     return results
 
 
-def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results, p):
+def _rgba_int(colour) -> int:
+    """(r,g,b[,a]) floats in 0..1 → signed-32-bit OME RGBA integer."""
+    c = list(colour) + [1.0] * (4 - len(colour))
+    r, g, b, a = (int(round(max(0.0, min(1.0, v)) * 255)) for v in c[:4])
+    v = ((r & 255) << 24) | ((g & 255) << 16) | ((b & 255) << 8) | (a & 255)
+    return v - (1 << 32) if v >= (1 << 31) else v
+
+
+def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results, p,
+                        channel_meta=None):
     """
-    Save a 4-channel processed label volume the user can actually SEE.
+    Save the processed masks as a multi-channel volume that mirrors the original
+    file's channels (same names, colours and channel order) and metadata
+    (pixel size from `p`).
 
-    Channels (Z, C, Y, X): [cell-id grays, soma, cilia, nucleus].  Masks are
-    written at full intensity (so they aren't an all-black uint16 image) and the
-    cell-id channel is scaled so each cell gets a distinct gray level.
+    `channel_meta` is a list (one entry per output channel, already in the
+    original channel order) of dicts:
+        {"name", "colour"(r,g,b 0..1), "data_key" in {cilia, soma, nucleus, cellid}}
+    Each channel is filled with the corresponding detection mask, so e.g. the
+    original cilia channel now holds the (length-recorded) cilia, the soma
+    channel holds the soma, and both nucleus channels hold the nucleus mask.
 
-    Writing order: try pylibCZIrw (read/write, supports Python 3.12) for .czi,
-    then czifile.imwrite if present, otherwise fall back to OME-TIFF.
+    Writing order: pylibCZIrw (Python 3.12 ok) for .czi, then czifile, else
+    OME-TIFF — all annotated with the metadata.
     """
     nucleus = nuc_labels > 0
-    maxlab  = int(nuc_labels.max()) if nuc_labels.size else 0
-    scale   = (65535.0 / maxlab) if maxlab > 0 else 0.0
-    cellid_vis = (nuc_labels.astype(np.float32) * scale).astype(np.uint16)
 
-    def vis(mask):
-        return (np.asarray(mask, dtype=bool).astype(np.uint16) * np.uint16(65535))
+    def _cellid_gray():
+        maxlab = int(nuc_labels.max()) if nuc_labels.size else 0
+        s = (65535.0 / maxlab) if maxlab > 0 else 0.0
+        return (nuc_labels.astype(np.float32) * s).astype(np.uint16)
 
-    stack = np.stack([cellid_vis, vis(soma_mask), vis(cilia_mask), vis(nucleus)],
-                     axis=0)             # (C, Z, Y, X)
-    zcyx = np.moveaxis(stack, 0, 1)      # (Z, C, Y, X)
-    C, Z = stack.shape[0], stack.shape[1]
+    masks = {
+        "cilia":   np.asarray(cilia_mask, dtype=bool),
+        "soma":    np.asarray(soma_mask, dtype=bool),
+        "nucleus": nucleus,
+    }
+
+    def channel_pixels(key):
+        if key == "cellid":
+            return _cellid_gray()
+        m = masks.get(key, nucleus)
+        return m.astype(np.uint16) * np.uint16(65535)
+
+    if not channel_meta:
+        channel_meta = [
+            {"name": "Cilia",   "colour": (1.0, 0.0, 1.0), "data_key": "cilia"},
+            {"name": "Soma",    "colour": (0.0, 1.0, 0.0), "data_key": "soma"},
+            {"name": "Nucleus", "colour": (0.0, 0.4, 1.0), "data_key": "nucleus"},
+        ]
+
+    planes  = [channel_pixels(m.get("data_key", "nucleus")) for m in channel_meta]
+    stack   = np.stack(planes, axis=0)   # (C, Z, Y, X)
+    zcyx    = np.moveaxis(stack, 0, 1)   # (Z, C, Y, X)
+    C, Z    = stack.shape[0], stack.shape[1]
+    names   = [str(m.get("name", f"Ch{i}")) for i, m in enumerate(channel_meta)]
+    colours = [m.get("colour", (1.0, 1.0, 1.0)) for m in channel_meta]
+    um = float(p.um_per_px) if p.um_per_px else 1.0
+    zs = float(p.z_um) if p.z_um and p.z_um > 0 else 0.0
 
     lower = str(path).lower()
     if lower.endswith(".czi"):
-        # 1) pylibCZIrw — writes 2-D planes by (C, Z) index.
+        # 1) pylibCZIrw — writes 2-D planes, then metadata (names + scale).
         try:
             from pylibCZIrw import czi as pyczi
             with pyczi.create_czi(path, exist_ok=True) as doc:
@@ -508,6 +578,15 @@ def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results,
                     for z in range(Z):
                         plane = np.ascontiguousarray(stack[c, z])[..., np.newaxis]
                         doc.write(data=plane, plane={"C": c, "Z": z})
+                try:
+                    doc.write_metadata(
+                        channel_names={c: names[c] for c in range(C)},
+                        scale_x=(um * 1e-6) or None,
+                        scale_y=(um * 1e-6) or None,
+                        scale_z=(zs * 1e-6) or None,
+                    )
+                except Exception as e_meta:
+                    print(f"[analysis] (CZI metadata partial: {e_meta})")
             print(f"[analysis] Saved processed CZI (pylibCZIrw): {path}")
             return path
         except Exception as e_pyczi:
@@ -526,13 +605,30 @@ def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results,
                       f"writing OME-TIFF instead: {path}")
 
     import tifffile
-    tifffile.imwrite(path, zcyx.astype(np.uint16), metadata={"axes": "ZCYX"})
-    print(f"[analysis] Saved processed volume: {path}")
-    return path
+    full = {"axes": "ZCYX",
+            "PhysicalSizeX": um, "PhysicalSizeXUnit": "µm",
+            "PhysicalSizeY": um, "PhysicalSizeYUnit": "µm",
+            "Channel": {"Name": names, "Color": [_rgba_int(c) for c in colours]}}
+    if zs > 0:
+        full["PhysicalSizeZ"] = zs
+        full["PhysicalSizeZUnit"] = "µm"
+    last: Exception = RuntimeError("write failed")
+    for md in (full,
+               {k: v for k, v in full.items() if k != "Channel"} |
+               {"Channel": {"Name": names}},
+               {"axes": "ZCYX"}):
+        try:
+            tifffile.imwrite(path, zcyx.astype(np.uint16), metadata=md)
+            print(f"[analysis] Saved processed volume: {path}")
+            return path
+        except Exception as e:
+            last = e
+    raise last
 
 
 def process_image(reader, mapping, n_z, um_per_px, params,
-                  progress=None, should_abort=None, save_path=None):
+                  progress=None, should_abort=None, save_path=None,
+                  channel_meta=None):
     """Run the full pipeline and return list[CellResult]."""
     p = params
 
@@ -601,10 +697,19 @@ def process_image(reader, mapping, n_z, um_per_px, params,
     results = measure_cilia_lengths(groups, p, sp)
     sp(1.0)
 
+    # Keep only cilia whose length was recorded (each kept cell's longest cilium)
+    # for the saved image, so the processed file matches the measurements table.
+    measured_cilia = np.zeros(cilia.shape, dtype=bool)
+    for cell in groups:
+        bp = cell.get("best_cilium")
+        if bp is not None and bp.slices:
+            measured_cilia[bp.slices] |= bp.unpack()
+
     if save_path:
         sp = stage("Saving processed file")
         try:
-            save_processed_file(save_path, model, nuclei, soma, cilia, results, p)
+            save_processed_file(save_path, model, nuclei, soma, measured_cilia,
+                                results, p, channel_meta=channel_meta)
         except Exception as e:
             print(f"[analysis] Save failed: {e}")
         sp(1.0)
@@ -697,8 +802,8 @@ try:
                 s.setDecimals(2); s.setValue(val); return s
 
             pgrid = QGridLayout()
-            self._combine = QComboBox(); self._combine.addItems(["and", "or"])
-            self._combine.setCurrentText("and")
+            self._combine = QComboBox(); self._combine.addItems(["And", "Or", "Nuc1", "Nuc2"])
+            self._combine.setCurrentText("And")
             self._floor    = fracspin(0.12)
             self._nuc_um   = umspin(5.0, 0.1)
             self._volfrac  = fracspin(1.0)
@@ -711,7 +816,7 @@ try:
 
             z_label = "Z-step / slice spacing" + ("  (from metadata)" if self._zum > 0 else "")
             rows = [
-                ("Both nuclei required",            self._combine),
+                ("Nucleus channels (And/Or/Nuc1/Nuc2)", self._combine),
                 ("Intensity floor (0–1)",           self._floor),
                 ("Minimum nucleus diameter",        self._nuc_um),
                 ("Nucleus volume fraction (volfrac)", self._volfrac),
@@ -757,8 +862,27 @@ try:
                 soma_search_um=self._somar_um.value(),
                 cilia_reach_um=self._reach_um.value(),
                 z_um=self._zstep_um.value(),
-                nucleus_combine=self._combine.currentText(),
+                nucleus_combine=self._combine.currentText().lower(),
             )
+
+            # One output channel per mapped stain, ordered by the original
+            # channel index, so the saved file mirrors the original channels
+            # (name, colour, order). Each carries that stain's detection mask.
+            stain_key = {"Cilia": "cilia", "GAD1 (Soma)": "soma",
+                         "Nucleus 1": "nucleus", "Nucleus 2": "nucleus"}
+            entries = []
+            for stain in STAINS:
+                idx = self._combos[stain].currentIndex()
+                ch  = self._channels[idx] if 0 <= idx < len(self._channels) else {}
+                entries.append({
+                    "raw":      ch.get("raw", idx),
+                    "name":     ch.get("name") or stain,
+                    "colour":   ch.get("colour", (1.0, 1.0, 1.0)),
+                    "data_key": stain_key[stain],
+                })
+            entries.sort(key=lambda e: e["raw"])
+            self.channel_meta = entries
+
             if self._save_chk.isChecked():
                 path, _ = QFileDialog.getSaveFileName(
                     self, "Save processed volume", "processed.ome.tif",
@@ -772,7 +896,8 @@ try:
         finished = pyqtSignal(object)
         error    = pyqtSignal(str)
 
-        def __init__(self, reader, mapping, n_z, um_per_px, params, save_path=None):
+        def __init__(self, reader, mapping, n_z, um_per_px, params,
+                     save_path=None, channel_meta=None):
             super().__init__()
             self._reader = reader
             self._mapping = mapping
@@ -780,6 +905,7 @@ try:
             self._um = um_per_px
             self._params = params
             self._save_path = save_path
+            self._channel_meta = channel_meta
             self._abort = False
 
         def abort(self):
@@ -792,6 +918,7 @@ try:
                     progress=lambda pct, msg: self.progress.emit(pct, msg),
                     should_abort=lambda: self._abort,
                     save_path=self._save_path,
+                    channel_meta=self._channel_meta,
                 )
                 self.finished.emit(res)
             except Exception:

@@ -546,7 +546,7 @@ class TiffSliceReader:
         print(f"[TiffSliceReader] axes={self._axes} shape={self._arr.shape}")
 
     def _raw_slice(self, c_idx: int, z_idx: int) -> np.ndarray:
-        return _tiff_plane(self._arr, self._axes, c_idx, z_idx) #type: ignore
+        return _tiff_plane(self._arr, self._axes, c_idx, z_idx) # type: ignore
 
     def get_slice(self, z: int, channel: int) -> np.ndarray:
         return _process_slice(self._raw_slice(channel, z))
@@ -965,6 +965,15 @@ class ZSliceCanvas(FigureCanvas):
                          yc + (ylim[1]-ylim[0]) / 2 / factor)
         self.fig.canvas.draw_idle()
 
+    def focus_window(self, xc: float, yc: float, half: float):
+        """Center the view on (xc, yc) with a half-width of `half` pixels.
+
+        ylim is inverted to match matplotlib's image (origin-upper) convention.
+        """
+        self.ax.set_xlim(xc - half, xc + half)
+        self.ax.set_ylim(yc + half, yc - half)
+        self.fig.canvas.draw_idle()
+
     def _on_press(self, event):
         if event.inaxes != self.ax or event.xdata is None:
             return
@@ -1347,6 +1356,7 @@ class ZViewerPanel(QWidget):
 
 class DataTablePanel(QWidget):
     COLUMNS = ["img_name", "num", "x", "y", "z", "length"]
+    import_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1387,6 +1397,19 @@ class DataTablePanel(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
+        self.btn_import = QPushButton("Import")
+        self.btn_import.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        self.btn_import.setFixedSize(90, 32)
+        self.btn_import.setStyleSheet("""
+            QPushButton {
+                background: #1a1a1a; color: #aaaaaa;
+                border: 2px solid #555; border-radius: 4px;
+            }
+            QPushButton:hover  { background: #555; color: #fff; }
+            QPushButton:pressed { background: #444; }
+        """)
+        self.btn_import.clicked.connect(self.import_requested.emit)
+        btn_row.addWidget(self.btn_import)
         self.btn_export = QPushButton("Export")
         self.btn_export.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
         self.btn_export.setFixedSize(90, 32)
@@ -1882,6 +1905,7 @@ class ScopeWindow(QMainWindow):
         self.overview_panel.canvas.marker_added.connect(self._on_marker_added)
         self.overview_panel.canvas.markers_deleted.connect(self._on_markers_deleted)
         self.overview_panel.file_loaded.connect(self._on_file_loaded)
+        self.table_panel.import_requested.connect(self._on_import_csv)
 
         self.zviewer_panel.canvas.measurement_done.connect(self._on_measurement_done)
         self.zviewer_panel.measure_toggled.connect(
@@ -2022,7 +2046,8 @@ class ScopeWindow(QMainWindow):
         n_z = self._czi_data.get("n_z", 1)
         um  = self._czi_data.get("um_per_px", 1.0)
         worker = DetectionWorker(self._slice_reader, dlg.mapping, n_z, um, dlg.params,
-                                 save_path=getattr(dlg, "save_path", None))
+                                 save_path=getattr(dlg, "save_path", None),
+                                 channel_meta=getattr(dlg, "channel_meta", None))
         worker.progress.connect(self._on_detect_progress)
         worker.finished.connect(self._on_detect_done)
         worker.error.connect(self._on_detect_error)
@@ -2047,9 +2072,10 @@ class ScopeWindow(QMainWindow):
         self.table_panel.table.setRowCount(0)
         self._markers = []
         for cell in results:
-            self._markers.append(
-                {"x": cell.x, "y": cell.y, "num": cell.num, "accepted": True})
             row = cell.as_row(self._current_file or "unknown")
+            self._markers.append(
+                {"x": cell.x, "y": cell.y, "num": cell.num, "accepted": True,
+                 "z": int(cell.z), "length": row["length"]})
             self.table_panel.add_row(row["img_name"], row["num"], row["x"],
                                      row["y"], row["z"], row["length"])
         self.overview_panel.canvas.set_markers(self._markers)
@@ -2342,6 +2368,13 @@ class ScopeWindow(QMainWindow):
         img = self._composite(self._zslice_floats)
         if img is not None:
             self.zviewer_panel.canvas.show_slice(img, preserve_view=preserve_view)
+            pf = getattr(self, "_pending_focus", None)
+            if pf is not None:
+                x, y, half, target_z = pf
+                # Only snap the window once the intended Z is actually showing.
+                if self.zviewer_panel.z_slider.value() == target_z:
+                    self.zviewer_panel.canvas.focus_window(x, y, half)
+                    self._pending_focus = None
 
     def _update_z_status(self, z: int):
         um  = self._czi_data.get("um_per_px", 1.0)
@@ -2368,21 +2401,90 @@ class ScopeWindow(QMainWindow):
         m = self._markers[idx]
         self.overview_panel.canvas.highlight_marker(idx)
         self.table_panel.table.selectRow(idx)
+
+        # Center the right view on a fixed 30 µm × 30 µm window at the cell's Z.
+        um   = self._czi_data.get("um_per_px", 1.0) or 1.0
+        half = (30.0 / um) / 2.0
+        n_z  = max(1, self._czi_data.get("n_z", 1))
+        z    = int(m.get("z", self.zviewer_panel.z_slider.value()))
+        z    = max(0, min(z, n_z - 1))
+        # Apply the focus once the (correct) Z slice has rendered.
+        self._pending_focus = (float(m["x"]), float(m["y"]), float(half), z)
+
+        slider = self.zviewer_panel.z_slider
+        if slider.value() != z:
+            slider.setValue(z)        # triggers the Z load → focus applied on ready
+        else:
+            self._request_z(z)        # already on this Z → re-render, then focus
+
         self.status.showMessage(
-            f"Cell {m['num']}  |  x={m['x']:.1f}  y={m['y']:.1f}  |  "
-            "use Z-slider to step through slices"
+            f"Cell {m['num']}  |  x={m['x']:.1f}  y={m['y']:.1f}  z={z}  "
+            f"|  30 µm view"
         )
 
     def _on_marker_added(self, x: float, y: float):
         num = max((m["num"] for m in self._markers), default=0) + 1
         z   = self.zviewer_panel.z_slider.value()
-        self._markers.append({"x": x, "y": y, "num": num, "accepted": True})
+        self._markers.append({"x": x, "y": y, "num": num, "accepted": True,
+                              "z": int(z), "length": "—"})
         self.overview_panel.canvas.set_markers(self._markers)
         self.table_panel.add_row(self._current_file or "unknown", num,
                                   round(x, 1), round(y, 1), z, "—")
         self.overview_panel.reset_mode()
         self._update_cell_count()
         self.status.showMessage(f"Cell {num} added at ({x:.1f}, {y:.1f})  z={z}")
+
+    def _on_import_csv(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import measurements (CSV)", "", "CSV files (*.csv);;All files (*)")
+        if not path:
+            return
+        import csv
+        try:
+            with open(path, newline="") as f:
+                reader = csv.DictReader(f)
+                fields = {(c or "").strip() for c in (reader.fieldnames or [])}
+                required = {"num", "x", "y", "z", "length"}
+                if not required.issubset(fields):
+                    QMessageBox.warning(
+                        self, "Import failed",
+                        "That CSV doesn't match the export format.\n\n"
+                        f"Expected columns: {', '.join(DataTablePanel.COLUMNS)}")
+                    return
+                rows = list(reader)
+        except Exception as e:
+            QMessageBox.critical(self, "Import error", str(e))
+            return
+
+        def _num(val, default):
+            try:
+                return int(float(val))
+            except (TypeError, ValueError):
+                return default
+
+        self.table_panel.table.setRowCount(0)
+        self._markers = []
+        skipped = 0
+        for i, row in enumerate(rows, start=1):
+            try:
+                x = float(row["x"]); y = float(row["y"])
+            except (TypeError, ValueError, KeyError):
+                skipped += 1
+                continue
+            num    = _num(row.get("num"), i)
+            z      = _num(row.get("z"), 0)
+            length = (row.get("length") or "—").strip() or "—"
+            img    = (row.get("img_name") or self._current_file or "imported").strip()
+            self._markers.append({"x": x, "y": y, "num": num, "accepted": True,
+                                  "z": z, "length": length})
+            self.table_panel.add_row(img, num, round(x, 1), round(y, 1), z, length)
+
+        self.overview_panel.canvas.set_markers(self._markers)
+        self._update_cell_count()
+        msg = f"Imported {len(self._markers)} cell(s) from {os.path.basename(path)}"
+        if skipped:
+            msg += f"  ({skipped} row(s) skipped)"
+        self.status.showMessage(msg)
 
     def _on_markers_deleted(self, indices: list):
         for i in sorted(indices, reverse=True):
