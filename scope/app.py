@@ -546,7 +546,7 @@ class TiffSliceReader:
         print(f"[TiffSliceReader] axes={self._axes} shape={self._arr.shape}")
 
     def _raw_slice(self, c_idx: int, z_idx: int) -> np.ndarray:
-        return _tiff_plane(self._arr, self._axes, c_idx, z_idx) # type: ignore
+        return _tiff_plane(self._arr, self._axes, c_idx, z_idx) #type: ignore
 
     def get_slice(self, z: int, channel: int) -> np.ndarray:
         return _process_slice(self._raw_slice(channel, z))
@@ -2041,6 +2041,11 @@ class ScopeWindow(QMainWindow):
         self._detect_progress.setWindowTitle("Analyze")
         self._detect_progress.setWindowModality(Qt.WindowModality.WindowModal)
         self._detect_progress.setMinimumDuration(0)
+        # Keep the bar visible across every stage: by default a QProgressDialog
+        # hides itself the moment a stage hits 100%, which makes slower stages
+        # (e.g. the cilia-gating distance transform) look like nothing is there.
+        self._detect_progress.setAutoReset(False)
+        self._detect_progress.setAutoClose(False)
         self._detect_progress.setValue(0)
 
         n_z = self._czi_data.get("n_z", 1)
@@ -2085,6 +2090,14 @@ class ScopeWindow(QMainWindow):
         n_cil = sum(1 for c in results if c.has_cilium)
         self.status.showMessage(
             f"Detection complete — {n} cell(s), {n_cil} with a measurable cilium")
+        if n == 0:
+            QMessageBox.information(
+                self, "Detection complete",
+                "Detection finished but found 0 cells.\n\n"
+                "The most common cause is the soma brightness test rejecting every "
+                "nucleus. Check the terminal output for the per-stage counts, then "
+                "try lowering the soma differential %, widening the comparison shell, "
+                "or confirming the GAD1 (Soma) channel is mapped correctly.")
 
     @pyqtSlot(str)
     def _on_detect_error(self, msg: str):

@@ -45,12 +45,15 @@ class DetectionParams:
     min_threshold:  float = 0.12     # intensity floor on [0,1]
     nucleus_combine: str  = "and"    # "and" = need both nuclei; "or" = either
 
-    # Nucleus / soma filters (3-D)
+    # Nucleus filter (3-D)
     min_nucleus_volume_vox: int = 300   # drop nuclei smaller than this
-    min_soma_surround_vox:  int = 200   # soma voxels required within soma_search_um
 
-    # Radius gates (microns; applied with anisotropic distance transforms)
-    soma_search_um:  float = 6.0     # soma must be within this of a nucleus
+    # Soma detection = local brightness-ratio test around each nucleus
+    soma_search_um:  float = 6.0     # inner radius (cytoplasm zone) around nucleus
+    soma_compare_um: float = 3.0     # width of the comparison shell beyond it
+    soma_ratio:      float = 1.15    # inner mean must exceed ratio × outer mean
+
+    # Radius gate
     cilia_reach_um:  float = 8.0     # cilia must be within this of soma
 
     # Cilia
@@ -63,19 +66,22 @@ class DetectionParams:
                       min_nucleus_diam_um: float = 5.0,
                       floor:           float = 0.12,
                       volfrac:         float = 1.0,
-                      surrfrac:        float = 0.25,
                       soma_search_um:  float = 6.0,
+                      soma_compare_um: float = 3.0,
+                      soma_diff_pct:   float = 15.0,
                       cilia_reach_um:  float = 8.0,
                       z_um:            float = 1.0,
                       nucleus_combine: str   = "and") -> "DetectionParams":
         """
-        Build parameters from physical sizes + the three advanced fractions.
+        Build parameters from physical sizes.
 
-          floor    : intensity threshold floor on [0,1].
-          volfrac  : a detected nucleus must reach >= volfrac × (volume of a
-                     sphere of `min_nucleus_diam_um`) to be kept.
-          surrfrac : >= surrfrac × (volume of the soma-search sphere) must be
-                     soma for a nucleus to count as a cell body.
+          floor          : intensity threshold floor on [0,1] (nuclei + cilia).
+          volfrac        : a detected nucleus must reach >= volfrac × (volume of
+                           a sphere of `min_nucleus_diam_um`) to be kept.
+          soma_search_um : inner radius around the nucleus (the cytoplasm zone).
+          soma_compare_um: width of the comparison shell just beyond it.
+          soma_diff_pct  : the inner mean GAD1 brightness must exceed the outer
+                           shell mean by at least this percentage.
         """
         r  = max(1e-6, float(um_per_px))
         zs = max(1e-6, float(z_um) if z_um and z_um > 0 else 1.0)
@@ -85,16 +91,14 @@ class DetectionParams:
         nuc_vol_um3 = (4.0 / 3.0) * math.pi * nuc_rad_um ** 3
         min_nuc_vox = max(8, int(float(volfrac) * nuc_vol_um3 / voxvol_um3))
 
-        sphere_um3   = (4.0 / 3.0) * math.pi * max(1e-6, soma_search_um) ** 3
-        min_surr_vox = max(8, int(float(surrfrac) * sphere_um3 / voxvol_um3))
-
         return cls(
             um_per_px=r, z_um=zs,
             gaussian_sigma=1.0, min_threshold=float(floor),
             nucleus_combine=nucleus_combine,
             min_nucleus_volume_vox=min_nuc_vox,
-            min_soma_surround_vox=min_surr_vox,
-            soma_search_um=soma_search_um,
+            soma_search_um=float(soma_search_um),
+            soma_compare_um=float(soma_compare_um),
+            soma_ratio=1.0 + max(0.0, float(soma_diff_pct)) / 100.0,
             cilia_reach_um=cilia_reach_um,
             cilia_min_voxels=4,
         )
@@ -189,7 +193,7 @@ def _threshold_volume(vol: np.ndarray, p: DetectionParams,
             sizes = np.bincount(lbl.ravel())
             keep = sizes >= min_size
             keep[0] = False
-            m = keep[lbl] # type: ignore
+            m = keep[lbl] #type: ignore
     return m
 
 
@@ -315,10 +319,13 @@ def denoise(reader, mapping, n_z, p, progress=None, should_abort=None):
 
 
 def build_3d_model(volumes, p):
-    """Threshold the denoised volumes into boolean nucleus / soma / cilia masks."""
+    """Threshold nucleus / cilia; keep the soma (GAD1) channel as intensity.
+
+    The soma is detected later by a local brightness-ratio test, so here we just
+    carry the normalised GAD1 volume through rather than thresholding it.
+    """
     nuc1 = _threshold_volume(volumes["nuc1"], p, min_size=p.cilia_min_voxels)
     nuc2 = _threshold_volume(volumes["nuc2"], p, min_size=p.cilia_min_voxels)
-    soma = _threshold_volume(volumes["gad"],  p, min_size=p.cilia_min_voxels)
     cilia = _threshold_volume(volumes["cilia"], p, min_size=p.cilia_min_voxels)
     mode = (p.nucleus_combine or "and").lower()
     if mode == "or":
@@ -329,7 +336,8 @@ def build_3d_model(volumes, p):
         nucleus = nuc2
     else:                       # "and" (default)
         nucleus = nuc1 & nuc2
-    return {"nucleus": nucleus, "soma": soma, "cilia": cilia}
+    return {"nucleus": nucleus, "cilia": cilia,
+            "soma_intensity": np.asarray(volumes["gad"], dtype=np.float32)}
 
 
 def remove_small_nuclei(nucleus_mask, p):
@@ -343,63 +351,115 @@ def remove_small_nuclei(nucleus_mask, p):
     return np.where(np.isin(labels, keep), labels, 0)
 
 
-def filter_nuclei_and_soma(nuc_labels, soma_mask, p, progress=None):
+def filter_nuclei_and_soma(nuc_labels, soma_intensity, p, progress=None):
     """
-    Single pass that does BOTH soma-related filters at once:
+    Detect GAD1+ soma by a LOCAL BRIGHTNESS-RATIO test around each nucleus.
 
-      • counts the soma lying within `soma_search_um` of each nucleus, dropping
-        any nucleus whose surrounding soma volume is below min_soma_surround_vox,
-        and
-      • keeps exactly that within-radius soma (soma outside every surviving
-        nucleus's radius is discarded).
+    For every nucleus, using distance from the nucleus surface:
+      • inner zone  = voxels with 0 < dist <= soma_search_um   (cytoplasm)
+      • outer shell = voxels with soma_search_um < dist <= soma_search_um
+                                                        + soma_compare_um
+    The nucleus is kept (counts as a cell body) only if
 
-    Returns (kept_nucleus_labels, kept_soma_mask).
+        median(GAD1 over inner)  >=  soma_ratio × median(GAD1 over outer)
 
-    This replaces the old remove_isolated_nuclei + remove_isolated_soma pair: it
-    reuses the per-nucleus distance transform for both the count and the keep,
-    so there's no second global distance transform over the whole volume.
+    e.g. 6 µm inner, 3 µm comparison shell, 15 % differential → keep when the
+    inner median exceeds 1.15× the 6–9 µm shell median.  (Median is used rather
+    than mean so a few very bright voxels don't dominate the comparison.)
+
+    Returns (kept_nucleus_labels, soma_mask), where soma_mask is the inner-zone
+    voxels (of kept nuclei) brighter than their own outer-shell median — i.e. the
+    actual bright cytoplasm, used downstream for cilia gating and the output.
     """
     from scipy import ndimage as ndi
     spacing = p.spacing()
-    R = p.soma_search_um
+    R_in  = float(p.soma_search_um)
+    R_out = R_in + float(p.soma_compare_um)
+    ratio = float(p.soma_ratio)
+    eps   = 1e-6
+
+    gad = np.asarray(soma_intensity, dtype=np.float32)
     ids = np.unique(nuc_labels)
     ids = ids[ids != 0]
-    kept_soma = np.zeros_like(soma_mask)
+    soma_mask = np.zeros(nuc_labels.shape, dtype=bool)
     if ids.size == 0:
-        return nuc_labels, kept_soma
+        return nuc_labels, soma_mask
 
-    pad  = [max(1, int(math.ceil(R / sp)) + 1) for sp in spacing]
+    pad  = [max(1, int(math.ceil(R_out / sp)) + 1) for sp in spacing]
     objs = ndi.find_objects(nuc_labels)
     step = max(1, len(ids) // 100)
     kept_nuc = np.zeros_like(nuc_labels)
+    n_err = 0
 
     for n, lab in enumerate(ids):
         if progress and n % step == 0:
             progress(n / len(ids), f"nucleus {n + 1}/{len(ids)}")
-        sl = objs[lab - 1]
-        if sl is None:
-            continue
-        zs, ys, xs = sl[0], sl[1], sl[2]
-        z0 = max(0, int(zs.start) - pad[0]); z1 = min(nuc_labels.shape[0], int(zs.stop) + pad[0])
-        y0 = max(0, int(ys.start) - pad[1]); y1 = min(nuc_labels.shape[1], int(ys.stop) + pad[1])
-        x0 = max(0, int(xs.start) - pad[2]); x1 = min(nuc_labels.shape[2], int(xs.stop) + pad[2])
+        try:
+            sl = objs[lab - 1]
+            if sl is None:
+                continue
+            zs, ys, xs = sl[0], sl[1], sl[2]
+            z0 = max(0, int(zs.start) - pad[0]); z1 = min(nuc_labels.shape[0], int(zs.stop) + pad[0])
+            y0 = max(0, int(ys.start) - pad[1]); y1 = min(nuc_labels.shape[1], int(ys.stop) + pad[1])
+            x0 = max(0, int(xs.start) - pad[2]); x1 = min(nuc_labels.shape[2], int(xs.stop) + pad[2])
 
-        nuc_crop  = (nuc_labels[z0:z1, y0:y1, x0:x1] == lab)
-        soma_crop = soma_mask[z0:z1, y0:y1, x0:x1]
-        dist = _edt(~nuc_crop, spacing)
-        zone = dist <= R
-        soma_in = soma_crop & zone
-        if int(soma_in.sum()) >= p.min_soma_surround_vox:
-            kept_nuc[z0:z1, y0:y1, x0:x1][nuc_crop] = lab
-            kept_soma[z0:z1, y0:y1, x0:x1] |= soma_in
-    return kept_nuc, kept_soma
+            nuc_crop = (nuc_labels[z0:z1, y0:y1, x0:x1] == lab)
+            gad_crop = gad[z0:z1, y0:y1, x0:x1]
+            dist  = _edt(~nuc_crop, spacing)
+            inner = (dist > 0) & (dist <= R_in)
+            outer = (dist > R_in) & (dist <= R_out)
+            if not inner.any() or not outer.any():
+                continue
+
+            inner_med = float(np.median(gad_crop[inner]))
+            outer_med = float(np.median(gad_crop[outer]))
+            if inner_med > eps and inner_med >= ratio * max(outer_med, eps):
+                kept_nuc[z0:z1, y0:y1, x0:x1][nuc_crop] = lab
+                bright = inner & (gad_crop > outer_med)
+                soma_mask[z0:z1, y0:y1, x0:x1] |= bright
+        except Exception as e:           # never let one nucleus abort the run
+            n_err += 1
+            if n_err <= 3:
+                print(f"[analysis] soma test skipped nucleus {lab}: {e}")
+    if n_err:
+        print(f"[analysis] soma test: {n_err} nucleus/nuclei skipped due to errors")
+    return kept_nuc, soma_mask
+
+
+def _near_mask(mask: np.ndarray, spacing, reach_um: float, factor: int = 4) -> np.ndarray:
+    """Voxels within `reach_um` of `mask`, via a DOWNSAMPLED distance transform.
+
+    A full-resolution distance_transform_edt allocates large internal feature
+    arrays (≈ several × the volume) — on big images that is the multi-GB / many-
+    minute bottleneck.  We block-reduce the mask by `factor` per axis (OR within
+    each block, so the result is slightly inclusive), run the EDT on that tiny
+    grid, threshold, and upsample back.  The reach gate is soft, so this is fine.
+    """
+    f = max(1, int(factor))
+    if f == 1:
+        if mask.all():
+            return np.ones_like(mask)
+        return _edt(~mask, spacing) <= reach_um
+
+    Z, Y, X = mask.shape
+    sz  = ((Z + f - 1) // f, (Y + f - 1) // f, (X + f - 1) // f)
+    pad = ((0, sz[0] * f - Z), (0, sz[1] * f - Y), (0, sz[2] * f - X))
+    sm  = np.pad(mask, pad).reshape(sz[0], f, sz[1], f, sz[2], f).any(axis=(1, 3, 5))
+    if sm.all():                                   # soma everywhere → all near
+        near_small = np.ones(sz, dtype=bool)
+    else:
+        coarse_spacing = (spacing[0] * f, spacing[1] * f, spacing[2] * f)
+        # +1 coarse-voxel margin so quantisation never drops borderline cilia.
+        near_small = _edt(~sm, coarse_spacing) <= (reach_um + max(coarse_spacing)) # type: ignore
+    near = np.repeat(np.repeat(np.repeat(near_small, f, axis=0), f, axis=1), f, axis=2)
+    return near[:Z, :Y, :X]
 
 
 def remove_isolated_cilia(cilia_mask, soma_mask, p):
     """Keep only cilia within cilia_reach_um of remaining soma."""
     if not soma_mask.any() or not cilia_mask.any():
         return np.zeros_like(cilia_mask)
-    near = _edt(~soma_mask, p.spacing()) <= p.cilia_reach_um
+    near = _near_mask(soma_mask, p.spacing(), p.cilia_reach_um, factor=4)
     return _components_touching(cilia_mask, cilia_mask & near, _ones3())
 
 
@@ -438,13 +498,32 @@ def group_cell_parts(nuc_labels, soma_mask, cilia_mask, p, progress=None):
         return cells
 
     cil_labels, n_cil = _label(cilia_mask, _ones3())
+    print(f"[analysis] cilia components labelled: {n_cil}", flush=True)
     if n_cil == 0:
         return cells
 
+    # Keep only components big enough to be a cilium BEFORE the heavy per-component
+    # work. With a bloated soma mask the cilia channel can have a huge number of
+    # tiny noise components; building find_objects/center_of_mass over all of them
+    # is what exhausts memory. Relabel the survivors compactly (1..K) so every
+    # subsequent op is O(K), not O(n_cil).
     areas = np.bincount(cil_labels.ravel(), minlength=n_cil + 1)
-    coms  = ndi.center_of_mass(cilia_mask, cil_labels, np.arange(1, n_cil + 1))
-    coms  = np.atleast_2d(np.asarray(coms, dtype=np.float64))
-    phys  = coms * spacing
+    valid = np.where(areas >= p.cilia_min_voxels)[0]
+    valid = valid[valid != 0]
+    print(f"[analysis] cilia components >= {p.cilia_min_voxels} vox: {valid.size}",
+          flush=True)
+    if valid.size == 0:
+        return cells
+
+    remap = np.zeros(n_cil + 1, dtype=np.int32)
+    remap[valid] = np.arange(1, valid.size + 1, dtype=np.int32)
+    clean = remap[cil_labels]            # type: ignore compact labels 1..K
+    del cil_labels
+    K = int(valid.size)
+
+    coms = ndi.center_of_mass(clean > 0, clean, np.arange(1, K + 1))
+    coms = np.atleast_2d(np.asarray(coms, dtype=np.float64))
+    phys = coms * spacing
 
     nuc_phys = np.asarray([c["phys"] for c in cells], dtype=np.float64)
     tree     = KDTree(nuc_phys)
@@ -455,22 +534,19 @@ def group_cell_parts(nuc_labels, soma_mask, cilia_mask, p, progress=None):
     attach_thresh = p.cilia_reach_um + p.soma_search_um + 0.5 * (
         2.0 * (3.0 * p.min_nucleus_volume_vox / (4.0 * math.pi)) ** (1.0 / 3.0))
 
-    cil_objs = ndi.find_objects(cil_labels)
-    step = max(1, n_cil // 200)
+    cil_objs = ndi.find_objects(clean)
+    step = max(1, K // 200)
 
-    for li in range(n_cil):
-        if progress and li % step == 0:
-            progress(li / n_cil, f"cilium {li + 1}/{n_cil}")
-        lab = li + 1
-        if areas[lab] < p.cilia_min_voxels:
+    for k in range(K):
+        if progress and k % step == 0:
+            progress(k / K, f"cilium {k + 1}/{K}")
+        if dists[k] > attach_thresh:
             continue
-        if dists[li] > attach_thresh:
-            continue
-        sl = cil_objs[li]
+        sl = cil_objs[k]
         if sl is None:
             continue
-        crop = (cil_labels[sl] == lab)
-        cells[int(nn[li])]["cilia"].append(PackedCrop.from_crop(crop, sl))
+        crop = (clean[sl] == (k + 1))
+        cells[int(nn[k])]["cilia"].append(PackedCrop.from_crop(crop, sl))
 
     return cells
 
@@ -669,26 +745,54 @@ def process_image(reader, mapping, n_z, um_per_px, params,
 
     sp = stage("Filtering nuclei by volume")
     nuclei = remove_small_nuclei(model["nucleus"], p)
+    model["nucleus"] = None          # free the binary nucleus volume
+    n_after_vol = int(np.unique(nuclei[nuclei > 0]).size)
+    print(f"[analysis] nuclei after volume filter: {n_after_vol} "
+          f"(min volume = {p.min_nucleus_volume_vox} vox)")
     sp(1.0)
     if aborted():
         return []
 
     sp = stage("Matching nuclei & soma")
-    nuclei, soma = filter_nuclei_and_soma(nuclei, model["soma"], p, sp)
+    nuclei, soma = filter_nuclei_and_soma(nuclei, model["soma_intensity"], p, sp)
+    model["soma_intensity"] = None   # free the GAD1 intensity volume
+    n_after_soma = int(np.unique(nuclei[nuclei > 0]).size)
+    soma_vox = int(soma.sum())
+    soma_frac = 100.0 * soma_vox / max(1, soma.size)
+    print(f"[analysis] nuclei kept by soma test: {n_after_soma} / {n_after_vol} "
+          f"(inner {p.soma_search_um} µm vs +{p.soma_compare_um} µm shell, "
+          f"ratio {p.soma_ratio:.2f}); soma voxels = {soma_vox} "
+          f"({soma_frac:.0f}% of volume)")
+    if n_after_soma == 0:
+        print("[analysis] NOTE: no nuclei passed the soma brightness test — "
+              "lower the differential %, widen the comparison shell, or check the "
+              "GAD1 (Soma) channel mapping.")
+    if soma_frac > 60.0:
+        print("[analysis] WARNING: soma covers most of the volume — cilia gating "
+              "will be ineffective and grouping may be very heavy. Consider a "
+              "smaller soma radius or a higher differential %.")
     sp(1.0)
     if aborted():
         return []
 
+    print("[analysis] stage 5: gating cilia by soma proximity…", flush=True)
     sp = stage("Removing cilia far from soma")
+    sp(0.3, "distance map")
     cilia_kept = remove_isolated_cilia(model["cilia"], soma, p)
     sp(1.0)
 
+    print("[analysis] stage 6: reinstating attached cilia…", flush=True)
     sp = stage("Reinstating attached cilia")
+    sp(0.3, "linking segments")
     cilia = reinstate_attached_cilia(model["cilia"], cilia_kept, p)
+    model["cilia"] = None            # no longer needed
+    del cilia_kept
     sp(1.0)
 
+    print("[analysis] stage 7: grouping cell parts…", flush=True)
     sp = stage("Grouping cell parts")
     groups = group_cell_parts(nuclei, soma, cilia, p, sp)
+    print(f"[analysis] cells grouped: {len(groups)}")
     sp(1.0)
     if aborted():
         return []
@@ -801,14 +905,19 @@ try:
                 s = QDoubleSpinBox(); s.setRange(0.0, 1.0); s.setSingleStep(0.01)
                 s.setDecimals(2); s.setValue(val); return s
 
+            def pctspin(val):
+                s = QDoubleSpinBox(); s.setRange(0.0, 1000.0); s.setSingleStep(1.0)
+                s.setDecimals(1); s.setValue(val); s.setSuffix(" %"); return s
+
             pgrid = QGridLayout()
             self._combine = QComboBox(); self._combine.addItems(["And", "Or", "Nuc1", "Nuc2"])
             self._combine.setCurrentText("And")
             self._floor    = fracspin(0.12)
             self._nuc_um   = umspin(5.0, 0.1)
             self._volfrac  = fracspin(1.0)
-            self._surrfrac = fracspin(0.25)
             self._somar_um = umspin(6.0, 0.1)
+            self._cmp_um   = umspin(3.0, 0.1)
+            self._somadiff = pctspin(15.0)
             self._reach_um = umspin(8.0, 0.1)
             self._zstep_um = QDoubleSpinBox(); self._zstep_um.setRange(0.01, 100.0)
             self._zstep_um.setSingleStep(0.1); self._zstep_um.setSuffix(" µm")
@@ -820,8 +929,9 @@ try:
                 ("Intensity floor (0–1)",           self._floor),
                 ("Minimum nucleus diameter",        self._nuc_um),
                 ("Nucleus volume fraction (volfrac)", self._volfrac),
-                ("Soma fraction in radius (surrfrac)", self._surrfrac),
-                ("Max soma distance from nucleus",  self._somar_um),
+                ("Soma radius (inner)",             self._somar_um),
+                ("Soma comparison shell width",     self._cmp_um),
+                ("Soma brightness differential",    self._somadiff),
                 ("Max cilia reach from soma",       self._reach_um),
                 (z_label,                           self._zstep_um),
             ]
@@ -832,9 +942,10 @@ try:
             self._save_chk = QCheckBox("Save processed volume after detection")
             outer.addWidget(self._save_chk)
 
-            hint = QLabel("floor = noise cutoff; volfrac = min nucleus size vs the "
-                          "diameter sphere; surrfrac = how much of the soma radius "
-                          "must be soma. Raise any of them to cut false positives.")
+            hint = QLabel("Soma test: a nucleus is GAD1+ only if the median soma-channel "
+                          "brightness within the inner radius exceeds the brightness in "
+                          "the comparison shell just beyond it by the differential %. "
+                          "Raise floor / volfrac / differential to cut false positives.")
             hint.setWordWrap(True); hint.setStyleSheet("color: #777; font-size: 10px;")
             outer.addWidget(hint)
 
@@ -858,8 +969,9 @@ try:
                 min_nucleus_diam_um=self._nuc_um.value(),
                 floor=self._floor.value(),
                 volfrac=self._volfrac.value(),
-                surrfrac=self._surrfrac.value(),
                 soma_search_um=self._somar_um.value(),
+                soma_compare_um=self._cmp_um.value(),
+                soma_diff_pct=self._somadiff.value(),
                 cilia_reach_um=self._reach_um.value(),
                 z_um=self._zstep_um.value(),
                 nucleus_combine=self._combine.currentText().lower(),
