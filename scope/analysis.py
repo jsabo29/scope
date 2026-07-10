@@ -53,12 +53,13 @@ class DetectionParams:
     soma_compare_um: float = 3.0     # width of the comparison shell beyond it
     soma_ratio:      float = 1.15    # inner mean must exceed ratio × outer mean
 
-    # Radius gate
-    cilia_reach_um:  float = 8.0     # cilia must be within this of soma
-
-    # Cilia
-    cilia_min_voxels: int = 4        # ignore cilia specks below this
-    connectivity:     int = 1        # 1 = faces, 3 = full 26-neighbour
+    # Cilia (detected by the flood-fill detector in cilia_finder.detect_cilia)
+    cilia_max_dist_um:      float = 8.0   # match a cilium to a cell if within this of it
+    cilia_min_volume_um3:   float = 0.5   # drop cilia specks below this physical volume
+    cilia_bright_threshold: float = 0.5   # flood-fill "bright" cut-off on [0,1]
+    cilia_dim_threshold:    float = 0.2   # bridgeable-dim cut-off; <=0 disables bridging
+    cilia_min_voxels:       int = 4       # derived from cilia_min_volume_um3
+    connectivity:           int = 1       # 1 = faces, 3 = full 26-neighbour
 
     # ------------------------------------------------------------------
     @classmethod
@@ -69,19 +70,30 @@ class DetectionParams:
                       soma_search_um:  float = 6.0,
                       soma_compare_um: float = 3.0,
                       soma_diff_pct:   float = 15.0,
-                      cilia_reach_um:  float = 8.0,
+                      cilia_max_dist_um: float = 8.0,
+                      cilia_min_volume_um3: float = 0.5,
+                      cilia_bright_threshold: float = 0.5,
+                      cilia_dim_threshold: float = 0.2,
                       z_um:            float = 1.0,
                       nucleus_combine: str   = "and") -> "DetectionParams":
         """
         Build parameters from physical sizes.
 
-          floor          : intensity threshold floor on [0,1] (nuclei + cilia).
-          volfrac        : a detected nucleus must reach >= volfrac × (volume of
-                           a sphere of `min_nucleus_diam_um`) to be kept.
-          soma_search_um : inner radius around the nucleus (the cytoplasm zone).
-          soma_compare_um: width of the comparison shell just beyond it.
-          soma_diff_pct  : the inner mean GAD1 brightness must exceed the outer
-                           shell mean by at least this percentage.
+          floor            : intensity threshold floor on [0,1] (nuclei + cilia).
+          volfrac          : a detected nucleus must reach >= volfrac × (volume of
+                             a sphere of `min_nucleus_diam_um`) to be kept.
+          soma_search_um   : inner radius around the nucleus (the cytoplasm zone).
+          soma_compare_um  : width of the comparison shell just beyond it.
+          soma_diff_pct    : the inner median GAD1 brightness must exceed the outer
+                             shell median by at least this percentage.
+          cilia_max_dist_um: a detected cilium is assigned to the nearest cell only
+                             if it lies within this distance of the cell centre.
+          cilia_min_volume_um3: a detected cilium component must reach this physical
+                             volume to be kept (removes noise specks).
+          cilia_bright_threshold: brightness on [0,1] at/above which a cilia voxel is
+                             "bright" and seeds/grows a flood-fill component.
+          cilia_dim_threshold: brightness at/above which a voxel is bridgeable "dim"
+                             signal (below it is background); <=0 disables bridging.
         """
         r  = max(1e-6, float(um_per_px))
         zs = max(1e-6, float(z_um) if z_um and z_um > 0 else 1.0)
@@ -90,6 +102,7 @@ class DetectionParams:
         nuc_rad_um  = max(1e-6, min_nucleus_diam_um) / 2.0
         nuc_vol_um3 = (4.0 / 3.0) * math.pi * nuc_rad_um ** 3
         min_nuc_vox = max(8, int(float(volfrac) * nuc_vol_um3 / voxvol_um3))
+        min_cil_vox = max(1, int(float(cilia_min_volume_um3) / voxvol_um3))
 
         return cls(
             um_per_px=r, z_um=zs,
@@ -99,8 +112,11 @@ class DetectionParams:
             soma_search_um=float(soma_search_um),
             soma_compare_um=float(soma_compare_um),
             soma_ratio=1.0 + max(0.0, float(soma_diff_pct)) / 100.0,
-            cilia_reach_um=cilia_reach_um,
-            cilia_min_voxels=4,
+            cilia_max_dist_um=float(cilia_max_dist_um),
+            cilia_min_volume_um3=float(cilia_min_volume_um3),
+            cilia_bright_threshold=float(cilia_bright_threshold),
+            cilia_dim_threshold=float(cilia_dim_threshold),
+            cilia_min_voxels=min_cil_vox,
         )
 
     def spacing(self):
@@ -165,10 +181,34 @@ def _norm_volume(vol: np.ndarray, lo_pct=0.5, hi_pct=99.5) -> np.ndarray:
     a  = vol.astype(np.float32)
     lo = float(np.percentile(a, lo_pct))
     hi = float(np.percentile(a, hi_pct))
+    if hi <= lo:
+        # Signal is sparser than hi_pct (e.g. thin cilia occupying <0.5% of
+        # voxels) — percentile clipping would crush it. Fall back to min/max so
+        # the bright structures survive normalisation.
+        lo = float(a.min())
+        hi = float(a.max())
     if hi > lo:
         a = (a - lo) / (hi - lo)
     else:
         a = np.zeros_like(a)
+    return np.clip(a, 0.0, 1.0)
+
+
+def _boost_contrast(vol: np.ndarray, min_lum: float = 0.99,
+                    contrast: float = 3.0) -> np.ndarray:
+    """Hard contrast stretch of a normalised [0,1] volume — the same operation as
+    the app's Process dialog with min-luminance and contrast pushed to their max.
+
+    Used on the cilia channel INSTEAD of Gaussian denoising: the blur erases thin
+    cilia, whereas maxing the black point (min_lum) and the gain about mid-grey
+    (contrast) saturates the faint cilia so they separate cleanly from background.
+    The leftover specks are removed later by the minimum-volume filter.
+    """
+    a = np.asarray(vol, dtype=np.float32)
+    if min_lum > 0.0:
+        a = np.clip((a - min_lum) / max(1e-6, 1.0 - min_lum), 0.0, 1.0)
+    if contrast != 1.0:
+        a = (a - 0.5) * contrast + 0.5
     return np.clip(a, 0.0, 1.0)
 
 
@@ -207,15 +247,6 @@ def _edt(mask: np.ndarray, spacing) -> np.ndarray:
     from scipy import ndimage as ndi
     return np.asarray(
         ndi.distance_transform_edt(mask, sampling=spacing))  # type: ignore[arg-type]
-
-
-def _components_touching(mask_all: np.ndarray, seed: np.ndarray,
-                         structure) -> np.ndarray:
-    labels, _ = _label(mask_all, structure)
-    touched = np.unique(labels[seed & (labels > 0)])
-    if touched.size == 0:
-        return np.zeros_like(mask_all)
-    return np.isin(labels, touched)
 
 
 def _skeleton_geodesic_um(mask: np.ndarray, spacing) -> float:
@@ -311,7 +342,14 @@ def denoise(reader, mapping, n_z, p, progress=None, should_abort=None):
             return None
         if progress:
             progress(0.8 + 0.2 * ci / len(order), f"denoising {k}")
-        smoothed = gaussian(_norm_volume(stacks[k]), sigma=sigma3)  # type: ignore[arg-type]
+        if k == "cilia":
+            # Don't denoise cilia — the Gaussian blurs thin cilia away. Instead
+            # apply a hard contrast stretch (contrast + min-luminance maxed) so the
+            # faint cilia saturate and separate from background; the minimum-volume
+            # filter downstream removes the leftover specks.
+            smoothed = _boost_contrast(_norm_volume(stacks[k]))
+        else:
+            smoothed = gaussian(_norm_volume(stacks[k]), sigma=sigma3)  # type: ignore[arg-type]
         stacks[k] = np.asarray(smoothed, dtype=np.float32)
     if progress:
         progress(1.0, "done")
@@ -319,14 +357,16 @@ def denoise(reader, mapping, n_z, p, progress=None, should_abort=None):
 
 
 def build_3d_model(volumes, p):
-    """Threshold nucleus / cilia; keep the soma (GAD1) channel as intensity.
+    """Threshold the nuclei; keep the cilia and GAD1 (soma) channels as intensity.
 
-    The soma is detected later by a local brightness-ratio test, so here we just
-    carry the normalised GAD1 volume through rather than thresholding it.
+    Cilia are detected later by the hand-written flood-fill detector
+    (`cilia_finder.detect_cilia`) directly on the (boosted, normalised) cilia
+    brightness volume, so that channel is carried through as intensity rather than
+    thresholded here. The soma is likewise detected later by a local
+    brightness-ratio test, so the GAD1 channel is also carried through.
     """
     nuc1 = _threshold_volume(volumes["nuc1"], p, min_size=p.cilia_min_voxels)
     nuc2 = _threshold_volume(volumes["nuc2"], p, min_size=p.cilia_min_voxels)
-    cilia = _threshold_volume(volumes["cilia"], p, min_size=p.cilia_min_voxels)
     mode = (p.nucleus_combine or "and").lower()
     if mode == "or":
         nucleus = nuc1 | nuc2
@@ -336,7 +376,8 @@ def build_3d_model(volumes, p):
         nucleus = nuc2
     else:                       # "and" (default)
         nucleus = nuc1 & nuc2
-    return {"nucleus": nucleus, "cilia": cilia,
+    return {"nucleus": nucleus,
+            "cilia": np.asarray(volumes["cilia"], dtype=np.float32),
             "soma_intensity": np.asarray(volumes["gad"], dtype=np.float32)}
 
 
@@ -426,162 +467,147 @@ def filter_nuclei_and_soma(nuc_labels, soma_intensity, p, progress=None):
     return kept_nuc, soma_mask
 
 
-def _near_mask(mask: np.ndarray, spacing, reach_um: float, factor: int = 4) -> np.ndarray:
-    """Voxels within `reach_um` of `mask`, via a DOWNSAMPLED distance transform.
-
-    A full-resolution distance_transform_edt allocates large internal feature
-    arrays (≈ several × the volume) — on big images that is the multi-GB / many-
-    minute bottleneck.  We block-reduce the mask by `factor` per axis (OR within
-    each block, so the result is slightly inclusive), run the EDT on that tiny
-    grid, threshold, and upsample back.  The reach gate is soft, so this is fine.
-    """
-    f = max(1, int(factor))
-    if f == 1:
-        if mask.all():
-            return np.ones_like(mask)
-        return _edt(~mask, spacing) <= reach_um
-
-    Z, Y, X = mask.shape
-    sz  = ((Z + f - 1) // f, (Y + f - 1) // f, (X + f - 1) // f)
-    pad = ((0, sz[0] * f - Z), (0, sz[1] * f - Y), (0, sz[2] * f - X))
-    sm  = np.pad(mask, pad).reshape(sz[0], f, sz[1], f, sz[2], f).any(axis=(1, 3, 5))
-    if sm.all():                                   # soma everywhere → all near
-        near_small = np.ones(sz, dtype=bool)
-    else:
-        coarse_spacing = (spacing[0] * f, spacing[1] * f, spacing[2] * f)
-        # +1 coarse-voxel margin so quantisation never drops borderline cilia.
-        near_small = _edt(~sm, coarse_spacing) <= (reach_um + max(coarse_spacing)) # type: ignore
-    near = np.repeat(np.repeat(np.repeat(near_small, f, axis=0), f, axis=1), f, axis=2)
-    return near[:Z, :Y, :X]
 
 
-def remove_isolated_cilia(cilia_mask, soma_mask, p):
-    """Keep only cilia within cilia_reach_um of remaining soma."""
-    if not soma_mask.any() or not cilia_mask.any():
-        return np.zeros_like(cilia_mask)
-    near = _near_mask(soma_mask, p.spacing(), p.cilia_reach_um, factor=4)
-    return _components_touching(cilia_mask, cilia_mask & near, _ones3())
-
-
-def reinstate_attached_cilia(cilia_all, cilia_kept, p):
-    """Add back cilia segments directly attached to the kept cilia."""
-    from scipy import ndimage as ndi
-    if not cilia_kept.any():
-        return cilia_kept
-    seed = ndi.binary_dilation(cilia_kept, structure=_ones3())
-    return _components_touching(cilia_all, seed & cilia_all, _ones3())
-
-
-def group_cell_parts(nuc_labels, soma_mask, cilia_mask, p, progress=None):
-    """Associate each surviving nucleus with its nearby cilia components.
-
-    Vectorised: component areas (bincount) and centroids (center_of_mass) in one
-    C-level pass each, nearest nucleus via KD-tree; only passing components get a
-    tiny bounding-box crop.  Cells with no cilia are kept (empty cilia list).
-    """
-    from scipy import ndimage as ndi
-    from scipy.spatial import KDTree
+def group_cell_parts(nuc_labels, p, progress=None):
+    """Build one cell record per surviving nucleus (centroid, physical position,
+    volume). Cilia are detected, measured and matched separately — see
+    `match_and_measure_cilia` — so this no longer touches the cilia channel."""
     from skimage.measure import regionprops
 
     spacing = np.asarray(p.spacing(), dtype=np.float64)
-
     cells = []
     for i, r in enumerate(regionprops(nuc_labels), start=1):
         cells.append({
             "num":      i,
-            "centroid": r.centroid,
-            "phys":     np.asarray(r.centroid) * spacing,
+            "label":    int(r.label),                     # value in nuc_labels
+            "centroid": r.centroid,                       # (z, y, x) voxels
+            "phys":     np.asarray(r.centroid) * spacing,  # microns
             "volume":   int(r.area),
-            "cilia":    [],
+            "best_len": 0.0,                              # longest matched cilium (µm)
+            "best_cilium": None,                         # PackedCrop of that cilium
+            "cilia":    [],                              # all cilia matched to this cell
         })
-    if not cells:
-        return cells
-
-    cil_labels, n_cil = _label(cilia_mask, _ones3())
-    print(f"[analysis] cilia components labelled: {n_cil}", flush=True)
-    if n_cil == 0:
-        return cells
-
-    # Keep only components big enough to be a cilium BEFORE the heavy per-component
-    # work. With a bloated soma mask the cilia channel can have a huge number of
-    # tiny noise components; building find_objects/center_of_mass over all of them
-    # is what exhausts memory. Relabel the survivors compactly (1..K) so every
-    # subsequent op is O(K), not O(n_cil).
-    areas = np.bincount(cil_labels.ravel(), minlength=n_cil + 1)
-    valid = np.where(areas >= p.cilia_min_voxels)[0]
-    valid = valid[valid != 0]
-    print(f"[analysis] cilia components >= {p.cilia_min_voxels} vox: {valid.size}",
-          flush=True)
-    if valid.size == 0:
-        return cells
-
-    remap = np.zeros(n_cil + 1, dtype=np.int32)
-    remap[valid] = np.arange(1, valid.size + 1, dtype=np.int32)
-    clean = remap[cil_labels]            # type: ignore compact labels 1..K
-    del cil_labels
-    K = int(valid.size)
-
-    coms = ndi.center_of_mass(clean > 0, clean, np.arange(1, K + 1))
-    coms = np.atleast_2d(np.asarray(coms, dtype=np.float64))
-    phys = coms * spacing
-
-    nuc_phys = np.asarray([c["phys"] for c in cells], dtype=np.float64)
-    tree     = KDTree(nuc_phys)
-    dists, nn = tree.query(phys)
-    dists = np.atleast_1d(np.asarray(dists, dtype=np.float64))
-    nn    = np.atleast_1d(np.asarray(nn, dtype=np.intp))
-
-    attach_thresh = p.cilia_reach_um + p.soma_search_um + 0.5 * (
-        2.0 * (3.0 * p.min_nucleus_volume_vox / (4.0 * math.pi)) ** (1.0 / 3.0))
-
-    cil_objs = ndi.find_objects(clean)
-    step = max(1, K // 200)
-
-    for k in range(K):
-        if progress and k % step == 0:
-            progress(k / K, f"cilium {k + 1}/{K}")
-        if dists[k] > attach_thresh:
-            continue
-        sl = cil_objs[k]
-        if sl is None:
-            continue
-        crop = (clean[sl] == (k + 1))
-        cells[int(nn[k])]["cilia"].append(PackedCrop.from_crop(crop, sl))
-
+        if progress and (i % 256 == 0):
+            progress(min(0.99, i / max(1, len(cells))), f"cell {i}")
     return cells
 
 
-def measure_cilia_lengths(groups, p, progress=None):
-    """Skeleton-geodesic length (µm) of each cell's longest cilium → CellResult."""
-    spacing = p.spacing()
-    results: list = []
-    total = max(1, len(groups))
-    step  = max(1, total // 100)
-    for k, cell in enumerate(groups, start=1):
-        if progress and (k - 1) % step == 0:
-            progress((k - 1) / total, f"cell {k}/{total}")
-        best_um = 0.0
-        best_packed = None
-        for packed in cell["cilia"]:
-            crop_bool = packed.unpack()
-            length = _skeleton_geodesic_um(crop_bool, spacing)
-            if length > best_um:
-                best_um = length
-                best_packed = packed
-            del crop_bool
-        # The recorded length is this cell's longest cilium; remember which one
-        # so the saved image can keep only cilia whose length was recorded.
-        cell["best_cilium"] = best_packed if best_um > 0.0 else None
-        cz, cy, cx = cell["centroid"]
-        results.append(CellResult(
-            num=cell["num"],
-            x=float(cx), y=float(cy), z=int(round(cz)),
-            cilia_length_um=float(best_um),
-            cilia_length_px=float(best_um / max(1e-6, p.um_per_px)),
-            has_cilium=best_um > 0.0,
-            nucleus_volume_vox=cell["volume"],
-        ))
-    return results
+def _voxels_to_crop(voxels: np.ndarray):
+    """Boolean bounding-box crop of a (N, 3) voxel list + its (z,y,x) slice tuple."""
+    mn = voxels.min(axis=0)
+    mx = voxels.max(axis=0)
+    shape = tuple(int(mx[i] - mn[i] + 1) for i in range(3))
+    crop = np.zeros(shape, dtype=bool)
+    crop[voxels[:, 0] - mn[0], voxels[:, 1] - mn[1], voxels[:, 2] - mn[2]] = True
+    sl = tuple(slice(int(mn[i]), int(mx[i]) + 1) for i in range(3))
+    return crop, sl
+
+
+def match_and_measure_cilia(cilia_vol, cells, p, progress=None):
+    """Detect cilia with the hand-written flood-fill detector, then assign each to
+    a cell and measure it.
+
+    Detection is delegated to `cilia_finder.detect_cilia`, which flood-fills the
+    cilia brightness volume into components and drops those below the minimum
+    volume. Matching is LARGEST-FIRST and one-per-cell: the biggest cilium takes
+    its closest cell within `cilia_max_dist_um`, that cell is then removed from
+    consideration, and so on (a cell never has more than one cilium).
+
+    Returns (list[CellResult] in cell order, detected-cilia mask). The mask is a
+    boolean full-volume image of every detected cilium (matched or not), so the
+    caller can show them all in the saved file for verification.
+    """
+    from scipy.spatial import KDTree
+    from .cilia_finder import detect_cilia
+
+    spacing = np.asarray(p.spacing(), dtype=np.float64)
+    empty   = np.zeros(cilia_vol.shape, dtype=bool)
+
+    def _emit():
+        lengths = sorted(c["best_len"] for c in cells if c["best_len"] > 0.0)
+        n_with  = len(lengths)
+        print(f"[analysis] cilia matched: {n_with}/{len(cells)} cells have a cilium")
+        if lengths:
+            med = lengths[len(lengths) // 2]
+            print(f"[analysis] cilium length µm — min {lengths[0]:.2f}, "
+                  f"median {med:.2f}, max {lengths[-1]:.2f}")
+        elif cells:
+            print("[analysis] NOTE: no cilia matched to cells. If cells should have "
+                  "cilia, raise the max cilia distance, lower the cilia bright "
+                  "threshold, or confirm the Cilia channel mapping.")
+        return [
+            CellResult(
+                num=c["num"],
+                x=float(c["centroid"][2]), y=float(c["centroid"][1]),
+                z=int(round(c["centroid"][0])),
+                cilia_length_um=float(c["best_len"]),
+                cilia_length_px=float(c["best_len"] / max(1e-6, p.um_per_px)),
+                has_cilium=c["best_len"] > 0.0,
+                nucleus_volume_vox=c["volume"],
+            )
+            for c in cells
+        ]
+
+    if not cells:
+        return _emit(), empty
+
+    # --- Detection: hand-written flood fill over the cilia brightness volume ----
+    dim = p.cilia_dim_threshold
+    dim_threshold = dim if 0.0 < dim < p.cilia_bright_threshold else None
+    detections = detect_cilia(
+        cilia_vol, p.cilia_min_volume_um3, spacing=tuple(spacing),
+        bright_threshold=p.cilia_bright_threshold, dim_threshold=dim_threshold)
+    K = len(detections)
+    print(f"[analysis] cilia detected (flood fill, bright≥{p.cilia_bright_threshold:g}, "
+          f"≥{p.cilia_min_volume_um3:g} µm³): {K}", flush=True)
+    if K == 0:
+        return _emit(), empty
+
+    # Paint every detected cilium into a mask for the saved-file visualisation.
+    detected = np.zeros(cilia_vol.shape, dtype=bool)
+    for det in detections:
+        vx = det["voxels"]
+        detected[vx[:, 0], vx[:, 1], vx[:, 2]] = True
+
+    coms      = np.asarray([det["centroid"] for det in detections], dtype=np.float64)
+    com_phys  = coms * spacing
+    comp_area = np.asarray([det["n_voxels"] for det in detections], dtype=np.int64)
+
+    cell_phys = np.asarray([c["phys"] for c in cells], dtype=np.float64)
+    tree = KDTree(cell_phys)
+
+    # Assign cilia LARGEST-FIRST: each cilium takes its closest cell that is
+    # within the radius AND not already claimed. Larger cilia get first pick.
+    order = np.argsort(-comp_area, kind="stable")   # detection indices, largest first
+    cell_taken = np.zeros(len(cells), dtype=bool)
+    reach = float(p.cilia_max_dist_um)
+    n_matched = 0
+    step = max(1, K // 200)
+    for idx, k in enumerate(order):
+        if progress and idx % step == 0:
+            progress(idx / max(1, K), f"cilium {idx + 1}/{K}")
+        cand = tree.query_ball_point(com_phys[k], reach)   # cells within radius
+        cand = [c for c in cand if not cell_taken[c]]
+        if not cand:
+            continue
+        d = np.linalg.norm(cell_phys[cand] - com_phys[k], axis=1)
+        best = int(cand[int(np.argmin(d))])                # closest free cell
+        cell_taken[best] = True
+
+        crop, sl = _voxels_to_crop(detections[k]["voxels"])
+        length = _skeleton_geodesic_um(crop, spacing)
+        cell = cells[best]
+        packed = PackedCrop.from_crop(crop, sl)
+        com = tuple(float(v) for v in coms[k])          # cilium centroid (z,y,x vox)
+        cell["cilia"].append({"crop": packed, "com": com, "length": length})
+        cell["best_len"] = length                       # one cilium per cell
+        cell["best_cilium"] = packed
+        n_matched += 1
+
+    print(f"[analysis] cilia matched to a cell (largest-first, one per cell): "
+          f"{n_matched}/{K} (reach {reach:g} µm)", flush=True)
+    return _emit(), detected
 
 
 def _rgba_int(colour) -> int:
@@ -593,7 +619,7 @@ def _rgba_int(colour) -> int:
 
 
 def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results, p,
-                        channel_meta=None):
+                        channel_meta=None, cilia_detected_vol=None):
     """
     Save the processed masks as a multi-channel volume that mirrors the original
     file's channels (same names, colours and channel order) and metadata
@@ -610,6 +636,10 @@ def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results,
     OME-TIFF — all annotated with the metadata.
     """
     nucleus = nuc_labels > 0
+    # `cilia_mask` may be a boolean mask OR a pre-graded uint16 visualisation
+    # (detected/measured/skeleton brightness levels). Use it as-is if integer.
+    cilia_arr = np.asarray(cilia_mask)
+    cilia_graded = cilia_arr if np.issubdtype(cilia_arr.dtype, np.integer) else None
 
     def _cellid_gray():
         maxlab = int(nuc_labels.max()) if nuc_labels.size else 0
@@ -617,7 +647,7 @@ def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results,
         return (nuc_labels.astype(np.float32) * s).astype(np.uint16)
 
     masks = {
-        "cilia":   np.asarray(cilia_mask, dtype=bool),
+        "cilia":   cilia_arr.astype(bool) if cilia_graded is None else None,
         "soma":    np.asarray(soma_mask, dtype=bool),
         "nucleus": nucleus,
     }
@@ -625,6 +655,14 @@ def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results,
     def channel_pixels(key):
         if key == "cellid":
             return _cellid_gray()
+        if key == "cilia_detected":
+            # Every cilium the flood-fill detector picked up, at full brightness.
+            # Falls back to a plain nucleus-label gray if absent.
+            if cilia_detected_vol is not None:
+                return np.asarray(cilia_detected_vol, dtype=np.uint16)
+            return _cellid_gray()
+        if key == "cilia" and cilia_graded is not None:
+            return cilia_graded.astype(np.uint16)
         m = masks.get(key, nucleus)
         return m.astype(np.uint16) * np.uint16(65535)
 
@@ -633,6 +671,8 @@ def save_processed_file(path, model, nuc_labels, soma_mask, cilia_mask, results,
             {"name": "Cilia",   "colour": (1.0, 0.0, 1.0), "data_key": "cilia"},
             {"name": "Soma",    "colour": (0.0, 1.0, 0.0), "data_key": "soma"},
             {"name": "Nucleus", "colour": (0.0, 0.4, 1.0), "data_key": "nucleus"},
+            # Detected cilia — keep the Cilia channel's name and colour.
+            {"name": "Cilia",   "colour": (1.0, 0.0, 1.0), "data_key": "cilia_detected"},
         ]
 
     planes  = [channel_pixels(m.get("data_key", "nucleus")) for m in channel_meta]
@@ -711,7 +751,7 @@ def process_image(reader, mapping, n_z, um_per_px, params,
     def aborted():
         return should_abort is not None and should_abort()
 
-    total = 8 + (1 if save_path else 0)
+    total = 6 + (1 if save_path else 0)
     state = {"i": 0}
 
     def stage(name):
@@ -768,52 +808,82 @@ def process_image(reader, mapping, n_z, um_per_px, params,
               "lower the differential %, widen the comparison shell, or check the "
               "GAD1 (Soma) channel mapping.")
     if soma_frac > 60.0:
-        print("[analysis] WARNING: soma covers most of the volume — cilia gating "
-              "will be ineffective and grouping may be very heavy. Consider a "
-              "smaller soma radius or a higher differential %.")
+        print("[analysis] WARNING: soma covers most of the volume — the soma test "
+              "is likely too permissive. Consider a smaller soma radius or a higher "
+              "differential %.")
     sp(1.0)
     if aborted():
         return []
 
-    print("[analysis] stage 5: gating cilia by soma proximity…", flush=True)
-    sp = stage("Removing cilia far from soma")
-    sp(0.3, "distance map")
-    cilia_kept = remove_isolated_cilia(model["cilia"], soma, p)
-    sp(1.0)
+    cilia = model["cilia"]                       # float brightness volume [0,1]
+    model["cilia"] = None
+    cil_vox = int((cilia >= p.cilia_bright_threshold).sum())
+    cil_frac = 100.0 * cil_vox / max(1, cilia.size)
+    print(f"[analysis] cilia bright voxels (≥{p.cilia_bright_threshold:g}): {cil_vox} "
+          f"({cil_frac:.1f}% of volume)", flush=True)
+    if cil_frac > 5.0:
+        print("[analysis] WARNING: cilia cover a large fraction of the volume — the "
+              "cilia channel is likely over-detecting noise. Raise the cilia bright "
+              "threshold.")
 
-    print("[analysis] stage 6: reinstating attached cilia…", flush=True)
-    sp = stage("Reinstating attached cilia")
-    sp(0.3, "linking segments")
-    cilia = reinstate_attached_cilia(model["cilia"], cilia_kept, p)
-    model["cilia"] = None            # no longer needed
-    del cilia_kept
-    sp(1.0)
-
-    print("[analysis] stage 7: grouping cell parts…", flush=True)
-    sp = stage("Grouping cell parts")
-    groups = group_cell_parts(nuclei, soma, cilia, p, sp)
-    print(f"[analysis] cells grouped: {len(groups)}")
+    print("[analysis] stage 5: grouping nuclei into cells…", flush=True)
+    sp = stage("Grouping cells")
+    cells = group_cell_parts(nuclei, p, sp)
+    print(f"[analysis] cells: {len(cells)}")
     sp(1.0)
     if aborted():
         return []
 
-    sp = stage("Measuring cilia")
-    results = measure_cilia_lengths(groups, p, sp)
+    print("[analysis] stage 6: matching & measuring cilia…", flush=True)
+    sp = stage("Matching & measuring cilia")
+    results, detected = match_and_measure_cilia(cilia, cells, p, sp)
     sp(1.0)
 
-    # Keep only cilia whose length was recorded (each kept cell's longest cilium)
-    # for the saved image, so the processed file matches the measurements table.
-    measured_cilia = np.zeros(cilia.shape, dtype=bool)
-    for cell in groups:
-        bp = cell.get("best_cilium")
-        if bp is not None and bp.slices:
-            measured_cilia[bp.slices] |= bp.unpack()
+    # ---- Build a GRADED, fully visible cilia channel for verification --------
+    # Three brightness levels so cilia can be checked against the numbers:
+    #   • every detected cilium (matched or not) -> dim   (≈ 1/3 range)
+    #   • the cilium matched to a cell           -> medium(≈ 2/3 range)
+    #   • the skeleton used for its length        -> bright(full range)
+    # Painting every detected cilium dim means the cilia always show up in the
+    # saved file, and unmatched cilia stay visible for tuning the reach/volume.
+    from skimage.morphology import skeletonize as _skel
+    DIM, MED, BRIGHT = np.uint16(22000), np.uint16(45000), np.uint16(65535)
+    cilia_vis = np.where(detected, DIM, np.uint16(0)).astype(np.uint16)
+
+    def _paint(slices, mask, value):
+        sub = cilia_vis[slices]
+        np.maximum(sub, mask.astype(np.uint16) * value, out=sub)
+
+    # Cilia channel grading: raise each matched cilium's body to medium and its
+    # measured skeleton to full brightness on top of the dim "all detected" layer.
+    n_drawn = 0
+    for cell in cells:
+        for item in cell["cilia"]:              # the cilium matched to this cell
+            packed = item["crop"]
+            if not packed.slices:
+                continue
+            body = packed.unpack()
+            _paint(packed.slices, body, MED)     # matched cilium — medium bright
+            try:
+                _paint(packed.slices, _skel(body), BRIGHT)  # measured skeleton
+            except Exception:
+                pass
+            n_drawn += 1
+
+    # Extra verification channel: just what the flood-fill detector picked up —
+    # every filtered cilium, at full brightness, nothing else.
+    cilia_detected_vis = np.where(detected, BRIGHT, np.uint16(0)).astype(np.uint16)
+    del cilia, detected
+    print(f"[analysis] cilia drawn into processed image: {n_drawn} matched "
+          f"(dim=all detected, medium=matched, bright=skeleton); extra detected-cilia "
+          f"channel shows every flood-fill-detected cilium")
 
     if save_path:
         sp = stage("Saving processed file")
         try:
-            save_processed_file(save_path, model, nuclei, soma, measured_cilia,
-                                results, p, channel_meta=channel_meta)
+            save_processed_file(save_path, model, nuclei, soma, cilia_vis,
+                                results, p, channel_meta=channel_meta,
+                                cilia_detected_vol=cilia_detected_vis)
         except Exception as e:
             print(f"[analysis] Save failed: {e}")
         sp(1.0)
@@ -919,6 +989,11 @@ try:
             self._cmp_um   = umspin(3.0, 0.1)
             self._somadiff = pctspin(15.0)
             self._reach_um = umspin(8.0, 0.1)
+            self._cil_vol  = QDoubleSpinBox(); self._cil_vol.setRange(0.0, 1000.0)
+            self._cil_vol.setSingleStep(0.1); self._cil_vol.setDecimals(2)
+            self._cil_vol.setValue(0.5); self._cil_vol.setSuffix(" µm³")
+            self._cil_bright = fracspin(0.5)
+            self._cil_dim    = fracspin(0.2)
             self._zstep_um = QDoubleSpinBox(); self._zstep_um.setRange(0.01, 100.0)
             self._zstep_um.setSingleStep(0.1); self._zstep_um.setSuffix(" µm")
             self._zstep_um.setValue(self._zum if self._zum > 0 else 1.0)
@@ -932,7 +1007,10 @@ try:
                 ("Soma radius (inner)",             self._somar_um),
                 ("Soma comparison shell width",     self._cmp_um),
                 ("Soma brightness differential",    self._somadiff),
-                ("Max cilia reach from soma",       self._reach_um),
+                ("Max cilia distance from cell",    self._reach_um),
+                ("Minimum cilia volume",            self._cil_vol),
+                ("Cilia bright threshold (0–1)",    self._cil_bright),
+                ("Cilia dim threshold (0 = off)",   self._cil_dim),
                 (z_label,                           self._zstep_um),
             ]
             for rr, (text, w) in enumerate(rows):
@@ -972,7 +1050,10 @@ try:
                 soma_search_um=self._somar_um.value(),
                 soma_compare_um=self._cmp_um.value(),
                 soma_diff_pct=self._somadiff.value(),
-                cilia_reach_um=self._reach_um.value(),
+                cilia_max_dist_um=self._reach_um.value(),
+                cilia_min_volume_um3=self._cil_vol.value(),
+                cilia_bright_threshold=self._cil_bright.value(),
+                cilia_dim_threshold=self._cil_dim.value(),
                 z_um=self._zstep_um.value(),
                 nucleus_combine=self._combine.currentText().lower(),
             )
@@ -993,6 +1074,16 @@ try:
                     "data_key": stain_key[stain],
                 })
             entries.sort(key=lambda e: e["raw"])
+            # Extra verification channel (not one of the original stains): every
+            # cilium the flood-fill detector picked up. Appended after the real
+            # channels, keeping the original Cilia channel's name and colour.
+            cil = next((e for e in entries if e["data_key"] == "cilia"), None)
+            entries.append({
+                "raw":      max((e["raw"] for e in entries), default=0) + 1,
+                "name":     cil["name"] if cil else "Cilia",
+                "colour":   cil["colour"] if cil else (1.0, 0.0, 1.0),
+                "data_key": "cilia_detected",
+            })
             self.channel_meta = entries
 
             if self._save_chk.isChecked():
