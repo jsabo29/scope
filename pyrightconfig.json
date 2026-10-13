@@ -1,5 +1,6 @@
 {
   "include": ["."],
-  "pythonVersion": "3.11",
+  "exclude": ["**/__pycache__", ".venv", "scope/analysis_backup.py"],
+  "pythonVersion": "3.12",
   "pythonPlatform": "All"
 }

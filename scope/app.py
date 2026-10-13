@@ -38,7 +38,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QMessageBox,
     QDialog, QCheckBox, QGridLayout, QScrollArea, QGroupBox,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, pyqtSlot, QObject
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, pyqtSlot, QObject, QSize, QSettings
 from PyQt6.QtGui import QFont, QAction, QActionGroup
 
 import matplotlib
@@ -50,10 +50,16 @@ from matplotlib.path import Path as MplPath
 
 # Cell-detection module (optional — app still runs if it's missing).
 try:
-    from .analysis import ChannelMapDialog, DetectionWorker  # type: ignore[import-not-found]
+    from .analysis import (  # type: ignore[import-not-found]
+        ChannelMapDialog, DetectionWorker, _fit_dialog_to_screen,
+    )
 except Exception as _e:   # pragma: no cover
     ChannelMapDialog = None
     DetectionWorker  = None
+
+    def _fit_dialog_to_screen(dlg, parent=None, margin: int = 80):  # type: ignore[misc]
+        return None
+
     print(f"[Scope] analysis module unavailable: {_e}")
 
 
@@ -99,6 +105,14 @@ def _colour_for_channel(name: str, color_hex: str, fallback_idx: int) -> list:
 # ---------------------------------------------------------------------------
 
 def _norm_to_float(arr2d: np.ndarray, lo_pct: float = 0.5, hi_pct: float = 99.5) -> np.ndarray:
+    """Per-plane percentile stretch — only for when no global range is known.
+
+    Stretching each plane on its own makes every plane fill the display range, so
+    an empty slice at the top of a stack shows its noise as brightly as a slice
+    full of real signal. That both makes Z-scrubbing flicker and, when the planes
+    are max-projected afterwards, pushes that amplified noise into the
+    projection. Prefer `_norm_with_range` with a per-channel volume range.
+    """
     a = arr2d.astype(np.float32)
     lo = float(np.percentile(a, lo_pct))
     hi = float(np.percentile(a, hi_pct))
@@ -107,6 +121,73 @@ def _norm_to_float(arr2d: np.ndarray, lo_pct: float = 0.5, hi_pct: float = 99.5)
     else:
         a = np.zeros_like(a)
     return np.clip(a, 0.0, 1.0)
+
+
+def _norm_with_range(arr2d: np.ndarray, rng) -> np.ndarray:
+    """Normalise a plane against a fixed (lo, hi) intensity range.
+
+    Every plane of a channel goes through the same transfer function, so
+    brightness is comparable across Z and consistent with the projection.
+    """
+    if rng is None:
+        return _norm_to_float(arr2d)
+    lo, hi = float(rng[0]), float(rng[1])
+    a = arr2d.astype(np.float32)
+    if hi > lo:
+        a = (a - lo) / (hi - lo)
+    else:
+        a = np.zeros_like(a)
+    return np.clip(a, 0.0, 1.0)
+
+
+class _RangeEstimator:
+    """Accumulates an intensity histogram for one channel across a whole stack.
+
+    Integer image data (what a CZI holds) has few enough distinct values to
+    histogram exactly, so whole-volume percentiles come out exact for the cost of
+    one bincount per plane. Float data falls back to a subsample.
+    """
+
+    def __init__(self, lo_pct: float = 0.5, hi_pct: float = 99.5):
+        self.lo_pct, self.hi_pct = lo_pct, hi_pct
+        self._hist = None
+        self._offset = 0
+        self._samples: list = []
+
+    def add(self, plane: np.ndarray):
+        plane = np.asarray(plane)
+        if np.issubdtype(plane.dtype, np.integer):
+            flat = plane.ravel()
+            mn, mx = int(flat.min()), int(flat.max())
+            if self._hist is None:
+                self._offset = min(0, mn)
+                self._hist = np.zeros(max(mx - self._offset + 1, 256), dtype=np.int64)
+            need = mx - self._offset + 1
+            if need > self._hist.size:
+                grown = np.zeros(need, dtype=np.int64)
+                grown[:self._hist.size] = self._hist
+                self._hist = grown
+            self._hist += np.bincount(flat - self._offset,
+                                      minlength=self._hist.size)[:self._hist.size]
+        else:
+            step = max(1, plane.size // 20000)
+            self._samples.append(plane.ravel()[::step].astype(np.float32))
+
+    def range(self):
+        if self._hist is not None:
+            total = int(self._hist.sum())
+            if total <= 0:
+                return (0.0, 1.0)
+            cdf = np.cumsum(self._hist)
+            lo = float(int(np.searchsorted(cdf, total * self.lo_pct / 100.0)) + self._offset)
+            hi = float(int(np.searchsorted(cdf, total * self.hi_pct / 100.0)) + self._offset)
+            return (lo, hi) if hi > lo else (lo, lo + 1.0)
+        if self._samples:
+            allv = np.concatenate(self._samples)
+            lo = float(np.percentile(allv, self.lo_pct))
+            hi = float(np.percentile(allv, self.hi_pct))
+            return (lo, hi) if hi > lo else (lo, lo + 1.0)
+        return (0.0, 1.0)
 
 
 def _to_uint8(arr: np.ndarray) -> np.ndarray:
@@ -155,6 +236,72 @@ def _select_plane(img, dims, c_idx: int, z_idx: int) -> np.ndarray:
             kwargs[d] = 0
     arr = img(**kwargs).asarray()
     return np.squeeze(arr)
+
+
+# ---------------------------------------------------------------------------
+# CZI metadata parsing
+# ---------------------------------------------------------------------------
+
+def _parse_czi_metadata(meta_xml: str):
+    """Pull channel names, display colours and voxel size out of a CZI's XML.
+
+    Returns ``(names, colours, um_per_px, z_um)``. `colours` are raw hex strings
+    as stored (``#AARRGGBB``); `z_um` is 0.0 when the file does not record it.
+
+    A CZI holds MORE THAN ONE ``<Channels>`` block: the acquisition block, which
+    carries the names, and a DisplaySetting block, which carries the colours the
+    microscope or writing software assigned. This used to take the first block it
+    found and read both from there, so colours came back empty on any file whose
+    colours live in the display block — including files Scope itself had written,
+    which then reopened in palette fallback colours rather than their own. Names
+    come from the first block; colours from whichever block actually has them.
+    """
+    import xml.etree.ElementTree as ET
+
+    names: list = []
+    colours: list = []
+    um_per_px, z_um = 1.0, 0.0
+    if not meta_xml:
+        return names, colours, um_per_px, z_um
+
+    root = ET.fromstring(meta_xml)
+    containers = list(root.iter("Channels"))
+    name_container = containers[0] if containers else None
+    colour_container = next(
+        (c for c in containers
+         if any(ch.find("Color") is not None for ch in c.findall("Channel"))),
+        None)
+
+    if colour_container is not None:
+        for ch_el in colour_container.findall("Channel"):
+            col_el = ch_el.find("Color")
+            colours.append(col_el.text.strip()
+                           if col_el is not None and col_el.text else "")
+
+    if name_container is not None:
+        for ch_el in name_container.findall("Channel"):
+            names.append(ch_el.get("Name", "") or "")
+            if colour_container is None:
+                col_el = ch_el.find("Color")
+                colours.append(col_el.text.strip()
+                               if col_el is not None and col_el.text else "")
+
+    # Scaling/Items gives per-axis Distance elements, in metres.
+    for dist in root.iter("Distance"):
+        axis   = dist.get("Id", "")
+        val_el = dist.find("Value")
+        if val_el is None or not val_el.text:
+            continue
+        try:
+            v_um = float(val_el.text) * 1e6
+        except ValueError:
+            continue
+        if axis == "X":
+            um_per_px = v_um
+        elif axis == "Z":
+            z_um = v_um
+
+    return names, colours, um_per_px, z_um
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +378,24 @@ class CziLoader(QThread):
             sizes = dict(img.sizes)
             ndim  = len(img.shape)
 
+            # `_select_plane` pins every dimension it is not addressing to 0. If
+            # any of those actually has extent — a mosaic (M), a time series (T),
+            # multiple rotations/illuminations — then everything downstream is
+            # looking at one tile / one timepoint, silently. Say so loudly rather
+            # than letting it pass for the whole image.
+            ignored = {d: int(sizes.get(d, 1)) for d in dims
+                       if d not in ("Y", "X", "C", "Z") and int(sizes.get(d, 1)) > 1}
+            if ignored:
+                detail = ", ".join(f"{d}={n}" for d, n in ignored.items())
+                print("=" * 64)
+                print(f"[Scope] WARNING: unhandled dimensions with extent: {detail}")
+                print("[Scope] Only index 0 of each is read, so the view and every")
+                print("[Scope] measurement cover ONE tile/timepoint, not the whole")
+                print("[Scope] image. For a mosaic, stitch it in ZEN and re-open.")
+                print("=" * 64)
+                self.signals.progress.emit(
+                    f"WARNING: showing index 0 of {detail} only")
+
             # ── TRUE channel count + Z, straight from the pixel data ─────
             n_c_pixel = int(sizes.get("C", 1))
             n_z       = int(sizes.get("Z", 1))
@@ -244,45 +409,12 @@ class CziLoader(QThread):
                 pixel_names.append(f"Ch{len(pixel_names)}")
 
             # ── Cross-check + display colours + pixel size from XML ──────
-            um_per_px = 1.0
-            z_um      = 0.0          # axial spacing (µm); 0 = not in metadata
-            xml_names: list = []
-            xml_colours: list = []
             try:
-                meta_xml: str = czi.metadata()
-                root = ET.fromstring(meta_xml)
-
-                channels_container = None
-                for candidate in root.iter("Channels"):
-                    channels_container = candidate
-                    break
-
-                if channels_container is not None:
-                    for ch_el in channels_container.findall("Channel"):
-                        xml_names.append(ch_el.get("Name", "") or "")
-                        col_el = ch_el.find("Color")
-                        if col_el is not None and col_el.text:
-                            xml_colours.append(col_el.text.strip())
-                        else:
-                            xml_colours.append("")
-
-                # Scaling/Items gives per-axis Distance elements (metres).
-                for dist in root.iter("Distance"):
-                    axis   = dist.get("Id", "")
-                    val_el = dist.find("Value")
-                    if val_el is None or not val_el.text:
-                        continue
-                    try:
-                        v_um = float(val_el.text) * 1e6
-                    except ValueError:
-                        continue
-                    if axis == "X":
-                        um_per_px = v_um
-                    elif axis == "Z":
-                        z_um = v_um
-
+                xml_names, xml_colours, um_per_px, z_um = _parse_czi_metadata(
+                    czi.metadata())
             except Exception as e:
                 print(f"[Scope] Metadata parse warning: {e}")
+                xml_names, xml_colours, um_per_px, z_um = [], [], 1.0, 0.0
 
             # ── Build channel_info (length == n_c_pixel) ─────────────────
             # Prefer pixel-data names; enrich with XML colours where indices
@@ -342,17 +474,34 @@ class CziLoader(QThread):
             print(f"[Scope] Projection using channels: {channel_subset}")
 
             n_sub     = len(channel_subset)
-            proj_norm = [np.zeros((H, W), dtype=np.float32) for _ in range(n_sub)]
+            # Max-project the RAW values, and accumulate each channel's intensity
+            # histogram as we go. Normalising each plane before the maximum (which
+            # is what this used to do) stretches every plane to full scale first,
+            # so slices holding nothing but noise contribute at the same
+            # brightness as slices holding signal — the projection ends up
+            # dominated by amplified background.
+            proj_raw = [np.full((H, W), -np.inf, dtype=np.float32) for _ in range(n_sub)]
+            est = [_RangeEstimator() for _ in range(n_sub)]
 
             for z in range(n_z):
                 if self._abort:
                     czi.close()
                     return
                 for i, raw_c in enumerate(channel_subset):
-                    sl = _select_plane(img, dims, raw_c, z).astype(np.float32)
-                    f  = _norm_to_float(sl)
-                    np.maximum(proj_norm[i], f, out=proj_norm[i])
+                    sl = _select_plane(img, dims, raw_c, z)
+                    est[i].add(sl)
+                    np.maximum(proj_raw[i], sl.astype(np.float32), out=proj_raw[i])
                 self.signals.pct.emit(15 + int(80 * (z + 1) / max(1, n_z)))
+
+            # One transfer function per channel, derived from the whole volume,
+            # used for both the projection and every Z slice.
+            display_ranges = [e.range() for e in est]
+            proj_norm = [_norm_with_range(proj_raw[i], display_ranges[i])
+                         for i in range(n_sub)]
+            del proj_raw
+            for i, raw_c in enumerate(channel_subset):
+                lo, hi = display_ranges[i]
+                print(f"[Scope] channel {raw_c} display range: {lo:.0f} – {hi:.0f}")
 
             # Default composite (all channels, max-combined) for the first paint.
             composite_proj = np.zeros((H, W, 3), dtype=np.float32)
@@ -379,10 +528,13 @@ class CziLoader(QThread):
                 "z_um":           z_um,
                 "projection":     proj_u8,
                 "proj_norm":      proj_norm,       # list[(H,W) float32], one per subset channel
+                "display_ranges": display_ranges,  # list[(lo, hi)] raw intensity, per subset channel
                 "channel_info":   channel_info,   # length == n_c_pixel
                 "channel_subset": channel_subset, # e.g. [20, 21, 22, 23]
                 "scene_key":      scene_key,
                 "dims":           dims,
+                "ignored_dims":   ignored,
+                "n_scenes":       len(scene_keys),
                 # Kept for backwards-compatibility with the rest of the app:
                 "axes":           "".join(dims),
                 "shape":          tuple(img.shape),
@@ -631,14 +783,22 @@ class TiffLoader(QThread):
 
             self.signals.progress.emit("Building per-channel max-Z projections…")
             self.signals.pct.emit(15)
-            proj_norm = [np.zeros((H, W), dtype=np.float32) for _ in channel_subset]
+            # Project raw, normalise once — see the note in CziLoader.run.
+            proj_raw = [np.full((H, W), -np.inf, dtype=np.float32)
+                        for _ in channel_subset]
+            est = [_RangeEstimator() for _ in channel_subset]
             for z in range(n_z):
                 if self._abort:
                     return
                 for i, c in enumerate(channel_subset):
-                    f = _norm_to_float(_tiff_plane(arr, axes, c, z))
-                    np.maximum(proj_norm[i], f, out=proj_norm[i])
+                    pl = _tiff_plane(arr, axes, c, z)
+                    est[i].add(pl)
+                    np.maximum(proj_raw[i], pl.astype(np.float32), out=proj_raw[i])
                 self.signals.pct.emit(15 + int(80 * (z + 1) / max(1, n_z)))
+            display_ranges = [e.range() for e in est]
+            proj_norm = [_norm_with_range(proj_raw[i], display_ranges[i])
+                         for i in range(len(channel_subset))]
+            del proj_raw
 
             composite = np.zeros((H, W, 3), dtype=np.float32)
             for i, c in enumerate(channel_subset):
@@ -659,6 +819,7 @@ class TiffLoader(QThread):
                 "z_um":           z_um,
                 "projection":     proj_u8,
                 "proj_norm":      proj_norm,
+                "display_ranges": display_ranges,
                 "channel_info":   channel_info,
                 "channel_subset": channel_subset,
                 "scene_key":      None,
@@ -704,10 +865,64 @@ def _hex_to_rgb_float(hex_str: str) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Shared pan helper
+# ---------------------------------------------------------------------------
+
+class _PanMixin:
+    """Drag-to-pan that tracks the cursor in PIXELS, not data coordinates.
+
+    Panning by data coordinates is self-defeating: `event.xdata` is where the
+    cursor is *given the axes limits right now*, and panning is precisely the act
+    of moving those limits. Each motion event therefore measures its delta
+    against a frame the previous event just shifted, so the correction never
+    settles and the image visibly shivers under the cursor.
+
+    Pixels are an absolute frame. The scale (data units per pixel) is taken once,
+    at button-press, from the starting limits and the axes box, and every delta
+    for the rest of the drag is measured against the pixel position where the
+    press happened. The image then tracks the cursor exactly.
+    """
+
+    def _pan_begin(self, event):
+        self._pan_px    = (event.x, event.y)
+        self._xlim_start = self.ax.get_xlim()
+        self._ylim_start = self.ax.get_ylim()
+        bbox = self.ax.get_window_extent()
+        w = max(1.0, float(bbox.width))
+        h = max(1.0, float(bbox.height))
+        # Signed, so an inverted y-axis (which is what imshow uses) is handled
+        # without a special case.
+        self._pan_scale = (
+            (self._xlim_start[1] - self._xlim_start[0]) / w,
+            (self._ylim_start[1] - self._ylim_start[0]) / h,
+        )
+
+    def _pan_active(self) -> bool:
+        return getattr(self, "_pan_px", None) is not None
+
+    def _pan_to(self, event) -> bool:
+        """Apply the drag. Works even when the cursor leaves the axes, so a pan
+        no longer stalls the moment you drag past the edge of the image."""
+        if not self._pan_active() or self._xlim_start is None or self._ylim_start is None:
+            return False
+        if event.x is None or event.y is None:
+            return False
+        dx = (event.x - self._pan_px[0]) * self._pan_scale[0]
+        dy = (event.y - self._pan_px[1]) * self._pan_scale[1]
+        self.ax.set_xlim(self._xlim_start[0] - dx, self._xlim_start[1] - dx)
+        self.ax.set_ylim(self._ylim_start[0] - dy, self._ylim_start[1] - dy)
+        self.fig.canvas.draw_idle()
+        return True
+
+    def _pan_end(self):
+        self._pan_px = None
+
+
+# ---------------------------------------------------------------------------
 # ImageCanvas  (top-left)
 # ---------------------------------------------------------------------------
 
-class ImageCanvas(FigureCanvas):
+class ImageCanvas(_PanMixin, FigureCanvas):
     cell_clicked    = pyqtSignal(int)
     marker_added    = pyqtSignal(float, float)
     markers_deleted = pyqtSignal(list)
@@ -727,7 +942,7 @@ class ImageCanvas(FigureCanvas):
         self._rect_patch      = None
         self._lasso_xy: list  = []
         self._lasso_line      = None
-        self._pan_start       = None
+        self._pan_px          = None
         self._xlim_start      = None
         self._ylim_start      = None
 
@@ -810,9 +1025,7 @@ class ImageCanvas(FigureCanvas):
                     self.cell_clicked.emit(i)
                     self._press_xy = None
                     return
-            self._pan_start  = (event.xdata, event.ydata)
-            self._xlim_start = self.ax.get_xlim()
-            self._ylim_start = self.ax.get_ylim()
+            self._pan_begin(event)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
         elif self._mode == MODE_ADD:
@@ -831,18 +1044,14 @@ class ImageCanvas(FigureCanvas):
             )
 
     def _on_motion(self, event):
+        # Pan first, and without the in-axes guard: a drag should keep working
+        # when the cursor runs off the edge of the image.
+        if self._mode == MODE_NORMAL and self._pan_active():
+            self._pan_to(event)
+            return
         if event.inaxes != self.ax or event.xdata is None or self._press_xy is None:
             return
-        if (self._mode == MODE_NORMAL
-                and self._pan_start is not None
-                and self._xlim_start is not None
-                and self._ylim_start is not None):
-            dx = event.xdata - self._pan_start[0]
-            dy = event.ydata - self._pan_start[1]
-            self.ax.set_xlim(self._xlim_start[0] - dx, self._xlim_start[1] - dx)
-            self.ax.set_ylim(self._ylim_start[0] - dy, self._ylim_start[1] - dy)
-            self.fig.canvas.draw_idle()
-        elif self._mode == MODE_ADD and self._rect_patch is not None:
+        if self._mode == MODE_ADD and self._rect_patch is not None:
             x0, y0 = self._press_xy
             self._rect_patch.set_width(event.xdata - x0)
             self._rect_patch.set_height(event.ydata - y0)
@@ -859,7 +1068,7 @@ class ImageCanvas(FigureCanvas):
         if self._press_xy is None:
             return
         if self._mode == MODE_NORMAL:
-            self._pan_start = None
+            self._pan_end()
             self.setCursor(Qt.CursorShape.ArrowCursor)
         elif self._mode == MODE_ADD and self._rect_patch is not None:
             if event.inaxes == self.ax and event.xdata is not None:
@@ -888,8 +1097,11 @@ class ImageCanvas(FigureCanvas):
 # ZSliceCanvas  (top-right)
 # ---------------------------------------------------------------------------
 
-class ZSliceCanvas(FigureCanvas):
-    measurement_done = pyqtSignal(float)
+class ZSliceCanvas(_PanMixin, FigureCanvas):
+    # Emits the traced polyline in image coordinates, [(x, y), ...]. The window
+    # pairs it with the Z it was drawn on and accumulates a 3-D length; the
+    # canvas itself has no idea which slice it is showing.
+    trace_done = pyqtSignal(object)
 
     def __init__(self, parent=None):
         self.fig = Figure(facecolor="#1a1a1a")
@@ -904,7 +1116,7 @@ class ZSliceCanvas(FigureCanvas):
         self._freehand_xy: list = []
         self._freehand_line = None
         self._measure_text  = None
-        self._pan_start     = None
+        self._pan_px        = None
         self._xlim_start    = None
         self._ylim_start    = None
 
@@ -993,12 +1205,14 @@ class ZSliceCanvas(FigureCanvas):
             )
             self.fig.canvas.draw_idle()
         else:
-            self._pan_start  = (event.xdata, event.ydata)
-            self._xlim_start = self.ax.get_xlim()
-            self._ylim_start = self.ax.get_ylim()
+            self._pan_begin(event)
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
 
     def _on_motion(self, event):
+        # Pan first, and without the in-axes guard — see _PanMixin.
+        if not self._measure_mode and self._pan_active():
+            self._pan_to(event)
+            return
         if event.inaxes != self.ax or event.xdata is None:
             return
         if self._measure_mode and self._freehand_line is not None:
@@ -1008,39 +1222,32 @@ class ZSliceCanvas(FigureCanvas):
                 [p[1] for p in self._freehand_xy]
             )
             self.fig.canvas.draw_idle()
-        elif (not self._measure_mode
-              and self._pan_start is not None
-              and self._xlim_start is not None
-              and self._ylim_start is not None):
-            dx = event.xdata - self._pan_start[0]
-            dy = event.ydata - self._pan_start[1]
-            self.ax.set_xlim(self._xlim_start[0] - dx, self._xlim_start[1] - dx)
-            self.ax.set_ylim(self._ylim_start[0] - dy, self._ylim_start[1] - dy)
-            self.fig.canvas.draw_idle()
+
+    def show_measure_label(self, text: str):
+        """Put the running measurement next to the last traced segment."""
+        if not self._freehand_xy:
+            return
+        pts = np.array(self._freehand_xy)
+        mid = pts[len(pts) // 2]
+        if self._measure_text is not None:
+            try:
+                self._measure_text.remove()
+            except Exception:
+                pass
+        self._measure_text = self.ax.text(
+            mid[0], mid[1] - 8, text,
+            color="#ff0099", fontsize=9,
+            ha="center", zorder=11,
+            bbox=dict(boxstyle="round,pad=0.2", fc="#1a1a1a",
+                      ec="#ff0099", alpha=0.7)
+        )
+        self.fig.canvas.draw_idle()
 
     def _on_release(self, event):
         if self._measure_mode and len(self._freehand_xy) > 1:
-            pts = np.array(self._freehand_xy)
-            diffs = np.diff(pts, axis=0)
-            length_px = float(np.sum(np.hypot(diffs[:, 0], diffs[:, 1])))
-            mid = pts[len(pts) // 2]
-            if self._measure_text is not None:
-                try:
-                    self._measure_text.remove()
-                except Exception:
-                    pass
-            self._measure_text = self.ax.text(
-                mid[0], mid[1] - 8,
-                f"{length_px:.1f} px",
-                color="#ff0099", fontsize=9,
-                ha="center", zorder=11,
-                bbox=dict(boxstyle="round,pad=0.2", fc="#1a1a1a",
-                          ec="#ff0099", alpha=0.7)
-            )
-            self.fig.canvas.draw_idle()
-            self.measurement_done.emit(length_px)
+            self.trace_done.emit(list(self._freehand_xy))
         elif not self._measure_mode:
-            self._pan_start = None
+            self._pan_end()
             self.setCursor(Qt.CursorShape.ArrowCursor)
 
 
@@ -1132,7 +1339,7 @@ class OverviewPanel(QWidget):
         if self._open_cid is not None:
             self.canvas.mpl_disconnect(self._open_cid)
             self._open_cid = None
-            self.canvas._pan_start  = None
+            self.canvas._pan_px     = None
             self.canvas._xlim_start = None
             self.canvas._ylim_start = None
             self.canvas._press_xy   = None
@@ -1185,7 +1392,7 @@ class OverviewPanel(QWidget):
         proj  = czi_data["projection"]
 
         self.canvas.show_image(proj)
-        self.canvas._pan_start  = None
+        self.canvas._pan_px     = None
         self.canvas._xlim_start = None
         self.canvas._ylim_start = None
         self.canvas._press_xy   = None
@@ -1197,6 +1404,25 @@ class OverviewPanel(QWidget):
             f"|  {czi_data['um_per_px']:.4f} µm/px"
         )
         self.status_lbl.setText("File loaded — run detection to populate cells")
+
+        # Loud, once, in the GUI: a partially-read image must not look like a
+        # whole one, because every count and length downstream would be wrong.
+        ignored = czi_data.get("ignored_dims") or {}
+        n_scenes = int(czi_data.get("n_scenes") or 0)
+        notes = []
+        if ignored:
+            notes.append("Unhandled dimensions: "
+                         + ", ".join(f"{d}={n}" for d, n in ignored.items())
+                         + ".\nOnly index 0 of each is read — this view and any "
+                           "detection cover one tile/timepoint, not the whole image."
+                           "\nFor a mosaic, stitch it in ZEN and re-open.")
+        if n_scenes > 1:
+            notes.append(f"This file has {n_scenes} scenes; scene "
+                         f"{czi_data.get('scene_key')!r} is loaded. "
+                         "Open the others separately to analyse them.")
+        if notes:
+            QMessageBox.warning(self, "Partial image loaded", "\n\n".join(notes))
+
         self.btn_plus.setEnabled(True)
         self.btn_minus.setEnabled(True)
         self.btn_zoomin.setEnabled(True)
@@ -1355,8 +1581,27 @@ class ZViewerPanel(QWidget):
 # ---------------------------------------------------------------------------
 
 class DataTablePanel(QWidget):
-    COLUMNS = ["img_name", "num", "x", "y", "z", "length"]
+    """The measurements table.
+
+    `img_name` and `num` are deliberately NOT live columns. They are pure
+    functions of the export — the image the rows came from, and the row's
+    position — so holding them in the table meant every add or delete had to
+    rewrite the numbering of every row after it, and a stale number was one
+    missed update away. They are generated in `_export` instead: `num` is just
+    the row index at the moment you export, and `img_name` rides along invisibly
+    on each row (so a CSV imported from a different image keeps its own name).
+    """
+
+    VIEW_COLUMNS   = ["x", "y", "z", "length"]
+    EXPORT_COLUMNS = ["img_name", "num", "x", "y", "z", "length"]
+    COLUMNS = EXPORT_COLUMNS          # back-compat for the import validator
+    LENGTH_COL = 3                    # index of "length" among VIEW_COLUMNS
+
+    # Per-row image name lives here rather than in a visible column.
+    IMG_ROLE = Qt.ItemDataRole.UserRole + 1
+
     import_requested = pyqtSignal()
+    export_requested = pyqtSignal()   # window supplies path defaults
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1364,8 +1609,9 @@ class DataTablePanel(QWidget):
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(4)
 
-        self.table = QTableWidget(0, len(self.COLUMNS))
-        self.table.setHorizontalHeaderLabels(self.COLUMNS)
+        self.default_img_name = ""        # set by the window on file load
+        self.table = QTableWidget(0, len(self.VIEW_COLUMNS))
+        self.table.setHorizontalHeaderLabels(self.VIEW_COLUMNS)
         _hdr = self.table.horizontalHeader()
         assert _hdr is not None
         _hdr.setStretchLastSection(True)
@@ -1376,14 +1622,29 @@ class DataTablePanel(QWidget):
             QTableWidget.EditTrigger.SelectedClicked
         )
         self.table.setAlternatingRowColors(True)
+        # Selection has to be written to beat the alternate-row rule. Both
+        # `::item:selected` and `::item:alternate` are single pseudo-states, so
+        # they carry equal specificity and whichever appears LAST wins — which is
+        # why every even row used to lose its highlight entirely. The compound
+        # `:alternate:selected` selector is more specific than either, so it
+        # settles the question regardless of order, and the `!active` variants
+        # keep the row visibly selected while focus sits on the image canvas.
         self.table.setStyleSheet("""
             QTableWidget {
                 background: #1a1a1a; color: #d0d0d0;
                 gridline-color: #333; border: none;
                 font-family: 'Courier New'; font-size: 10px;
+                selection-background-color: #00558a;
+                selection-color: #ffffff;
             }
-            QTableWidget::item:selected { background: #003355; color: #fff; }
-            QTableWidget::item:alternate { background: #1f1f1f; }
+            QTableWidget::item            { background: #1a1a1a; }
+            QTableWidget::item:alternate  { background: #1f1f1f; }
+            QTableWidget::item:selected,
+            QTableWidget::item:alternate:selected,
+            QTableWidget::item:selected:!active,
+            QTableWidget::item:alternate:selected:!active {
+                background: #00558a; color: #ffffff;
+            }
             QHeaderView::section {
                 background: #252525; color: #888;
                 border: none; border-bottom: 1px solid #444;
@@ -1391,7 +1652,7 @@ class DataTablePanel(QWidget):
                 font-family: 'Courier New'; font-size: 10px;
             }
         """)
-        for i, w in enumerate([160, 45, 65, 65, 45, 80]):
+        for i, w in enumerate([90, 90, 60, 110]):   # x, y, z, length
             self.table.setColumnWidth(i, w)
         layout.addWidget(self.table, stretch=1)
 
@@ -1425,39 +1686,51 @@ class DataTablePanel(QWidget):
         btn_row.addWidget(self.btn_export)
         layout.addLayout(btn_row)
 
-    def add_row(self, img_name, num, x, y, z, length):
+    def add_row(self, x, y, z, length, img_name: str = ""):
         r = self.table.rowCount()
         self.table.insertRow(r)
-        for col, val in enumerate([img_name, num, x, y, z, length]):
+        for col, val in enumerate([x, y, z, length]):
             item = QTableWidgetItem(str(val))
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(r, col, item)
+        first = self.table.item(r, 0)
+        if first is not None:
+            first.setData(self.IMG_ROLE, img_name or self.default_img_name)
+
+    def row_img_name(self, row: int) -> str:
+        item = self.table.item(row, 0)
+        if item is not None:
+            v = item.data(self.IMG_ROLE)
+            if v:
+                return str(v)
+        return self.default_img_name or "unknown"
 
     def remove_rows(self, indices: list):
         for i in sorted(indices, reverse=True):
             self.table.removeRow(i)
 
+    def export_to(self, path: str) -> int:
+        """Write the table as CSV, generating img_name and num at this moment.
+
+        Returns the number of rows written.
+        """
+        import csv
+        with open(path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(self.EXPORT_COLUMNS)
+            n = 0
+            for row in range(self.table.rowCount()):
+                cells = [self.table.item(row, c).text()
+                         if self.table.item(row, c) is not None else ""
+                         for c in range(self.table.columnCount())]
+                # num is the row's position at export time — nothing to keep in
+                # sync while cells are being added and removed.
+                writer.writerow([self.row_img_name(row), row + 1] + cells)
+                n += 1
+        return n
+
     def _export(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export measurements", "cilia_measurements.csv",
-            "CSV files (*.csv)"
-        )
-        if not path:
-            return
-        try:
-            import csv
-            with open(path, "w", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(self.COLUMNS)
-                for row in range(self.table.rowCount()):
-                    cells = []
-                    for col in range(self.table.columnCount()):
-                        item = self.table.item(row, col)
-                        cells.append(item.text() if item is not None else "")
-                    writer.writerow(cells)
-            print(f"[Scope] Exported to {path}")
-        except Exception as e:
-            print(f"[Scope] Export failed: {e}")
+        self.export_requested.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -1513,11 +1786,12 @@ class _ProjCacheWorker(QThread):
     channel_ready = pyqtSignal(int, object)   # (raw channel idx, float32 HxW)
     all_done      = pyqtSignal()
 
-    def __init__(self, reader, subset: list, n_z: int):
+    def __init__(self, reader, subset: list, n_z: int, ranges: dict | None = None):
         super().__init__()
         self._reader = reader
         self._subset = list(subset)
         self._n_z    = max(1, int(n_z))
+        self._ranges = dict(ranges or {})
         self._cancelled = False
 
     def cancel(self):
@@ -1527,18 +1801,25 @@ class _ProjCacheWorker(QThread):
         for raw in self._subset:
             if self._cancelled:
                 return
+            # Max-project raw, normalise once at the end (see CziLoader.run).
             acc = None
+            est = _RangeEstimator()
+            have_range = raw in self._ranges
             for z in range(self._n_z):
                 if self._cancelled:
                     return
                 try:
-                    f = _norm_to_float(self._reader._raw_slice(raw, z))
+                    pl = np.asarray(self._reader._raw_slice(raw, z))
                 except Exception as e:
                     print(f"[Scope] proj-cache read error (c={raw}, z={z}): {e}")
                     continue
-                acc = f if acc is None else np.maximum(acc, f)
+                if not have_range:
+                    est.add(pl)
+                pf = pl.astype(np.float32)
+                acc = pf if acc is None else np.maximum(acc, pf)
             if acc is not None and not self._cancelled:
-                self.channel_ready.emit(raw, acc)
+                rng = self._ranges.get(raw) or est.range()
+                self.channel_ready.emit(raw, _norm_with_range(acc, rng))
         if not self._cancelled:
             self.all_done.emit()
 
@@ -1564,9 +1845,10 @@ class _ZSliceWorker(QThread):
 
     ready = pyqtSignal(int, object)   # (z, {raw: float32 map})
 
-    def __init__(self, reader, mem_budget_mb: int = 256):
+    def __init__(self, reader, mem_budget_mb: int = 256, ranges: dict | None = None):
         super().__init__()
         self._reader = reader
+        self._ranges = dict(ranges or {})
         self._cond   = threading.Condition()
         self._req    = None            # (z, tuple(raw channels))
         self._stop   = False
@@ -1595,7 +1877,10 @@ class _ZSliceWorker(QThread):
         if cached is not None:
             self._cache.move_to_end(key)
             return cached
-        plane = _norm_to_float(self._reader._raw_slice(raw, z))
+        # Same per-channel transfer function as the projection, so brightness
+        # does not jump around as the Z slider moves.
+        plane = _norm_with_range(self._reader._raw_slice(raw, z),
+                                 self._ranges.get(raw))
         self._cache[key] = plane
         self._mem += plane.nbytes
         # Evict least-recently-used until back under budget.
@@ -1724,7 +2009,9 @@ class ProcessDialog(QDialog):
             row += 1
 
         scroll.setWidget(inner)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         outer.addWidget(scroll, stretch=1)
+        self._inner = inner
 
         btn_row = QHBoxLayout()
         btn_row.addStretch()
@@ -1735,6 +2022,12 @@ class ProcessDialog(QDialog):
         btn_row.addWidget(reset)
         btn_row.addWidget(close)
         outer.addLayout(btn_row)
+
+        _fit_dialog_to_screen(self, parent)
+
+    def sizeHint(self):
+        inner = self._inner.sizeHint()
+        return QSize(max(480, inner.width() + 44), inner.height() + 76)
 
     # -- widget factories ------------------------------------------------
     def _make_slider(self, maximum: int, value: int):
@@ -1827,6 +2120,13 @@ class ScopeWindow(QMainWindow):
         self._proc_dialog = None
         self._vis_actions: list = []      # checkable Channel-menu actions
         self._overlap_mode = False        # show colocalisation instead of additive
+        self._display_ranges: dict = {}   # raw channel idx -> (lo, hi) intensity
+        # Guards the two-way tie between the table selection and the canvas
+        # marker, so selecting one does not bounce back and reselect the other.
+        self._syncing_selection = False
+        # 3-D ruler: list of (points, z) traces accumulated since the tool was
+        # last enabled, so a cilium can be followed across slices.
+        self._measure_track: list = []
 
         self.overview_panel = OverviewPanel()
         self.zviewer_panel  = ZViewerPanel()
@@ -1906,14 +2206,13 @@ class ScopeWindow(QMainWindow):
         self.overview_panel.canvas.markers_deleted.connect(self._on_markers_deleted)
         self.overview_panel.file_loaded.connect(self._on_file_loaded)
         self.table_panel.import_requested.connect(self._on_import_csv)
+        self.table_panel.export_requested.connect(self._on_export_csv)
+        _sel = self.table_panel.table.selectionModel()
+        if _sel is not None:
+            _sel.selectionChanged.connect(self._on_table_selection_changed)
 
-        self.zviewer_panel.canvas.measurement_done.connect(self._on_measurement_done)
-        self.zviewer_panel.measure_toggled.connect(
-            lambda on: self.status.showMessage(
-                "Measure mode — drag along the cilia to trace its length" if on
-                else "Measure mode OFF"
-            )
-        )
+        self.zviewer_panel.canvas.trace_done.connect(self._on_trace_done)
+        self.zviewer_panel.measure_toggled.connect(self._on_measure_toggled)
         self.zviewer_panel.z_changed.connect(self._on_z_changed)
 
     # ------------------------------------------------------------------
@@ -1962,6 +2261,7 @@ class ScopeWindow(QMainWindow):
             self._set_channel_visible(i, visible, "all", render=False)
         self._render_overview(preserve_view=True)
         self._recomposite_z(preserve_view=True)
+        self._save_channel_prefs()
 
     def _set_channel_visible(self, idx: int, visible: bool,
                              source: str = "", render: bool = True):
@@ -1981,6 +2281,7 @@ class ScopeWindow(QMainWindow):
         if render:
             self._render_overview(preserve_view=True)
             self._recomposite_z(preserve_view=True)
+            self._save_channel_prefs()
 
     def _set_overlap_mode(self, on: bool):
         self._overlap_mode = bool(on)
@@ -1988,6 +2289,7 @@ class ScopeWindow(QMainWindow):
         # that's needed — no disk reads.
         self._render_overview(preserve_view=True)
         self._recomposite_z(preserve_view=True)
+        self._save_channel_prefs()
 
     # ------------------------------------------------------------------
     # Process dialog (brightness / contrast / min-luminescence)
@@ -2010,6 +2312,79 @@ class ScopeWindow(QMainWindow):
         # pure CPU — recomposite both panels from cache, no disk access.
         self._render_overview(preserve_view=True)
         self._recomposite_z(preserve_view=True)
+        self._save_channel_prefs()
+
+    # ------------------------------------------------------------------
+    # Remembering the processing settings
+    # ------------------------------------------------------------------
+    #
+    # Levels are a property of how a stain was acquired, not of one file, so a
+    # user working through a batch sets them once and wants them to stick — both
+    # across files in a session and across restarts. They are keyed by channel
+    # NAME (e.g. "AF647"), because the absolute channel index differs between
+    # acquisitions while the fluorophore does not; the subset position is the
+    # fallback when a name is missing.
+
+    _PREF_KEYS = ("brightness", "contrast", "min_lum", "visible")
+
+    def _settings(self) -> QSettings:
+        return QSettings("Scope", "Scope")
+
+    def _save_channel_prefs(self):
+        if not self._channels:
+            return
+        try:
+            import json
+            by_name = {
+                (ch.get("name") or f"__idx{i}"): {k: ch[k] for k in self._PREF_KEYS}
+                for i, ch in enumerate(self._channels)
+            }
+            by_index = [{k: ch[k] for k in self._PREF_KEYS} for ch in self._channels]
+            s = self._settings()
+            s.setValue("channel_prefs_by_name", json.dumps(by_name))
+            s.setValue("channel_prefs_by_index", json.dumps(by_index))
+            s.setValue("overlap_mode", bool(self._overlap_mode))
+        except Exception as e:
+            print(f"[Scope] could not save processing settings: {e}")
+
+    def _apply_saved_channel_prefs(self) -> bool:
+        """Push the remembered levels onto the freshly-built channel list.
+
+        Returns True if anything was restored.
+        """
+        if not self._channels:
+            return False
+        try:
+            import json
+            s = self._settings()
+            by_name = json.loads(s.value("channel_prefs_by_name") or "{}")
+            by_index = json.loads(s.value("channel_prefs_by_index") or "[]")
+            self._overlap_mode = str(s.value("overlap_mode", "false")).lower() in (
+                "true", "1", "yes")
+        except Exception as e:
+            print(f"[Scope] could not read saved processing settings: {e}")
+            return False
+
+        applied = 0
+        for i, ch in enumerate(self._channels):
+            saved = by_name.get(ch.get("name") or "")
+            if saved is None and i < len(by_index):
+                saved = by_index[i]
+            if not isinstance(saved, dict):
+                continue
+            for k in self._PREF_KEYS:
+                if k in saved:
+                    ch[k] = (bool(saved[k]) if k == "visible" else float(saved[k]))
+            applied += 1
+
+        # Never restore into a completely blank view — a user who hid everything
+        # before quitting would otherwise reopen to a black window with no clue
+        # why. Levels are kept; visibility is reset.
+        if applied and not any(ch["visible"] for ch in self._channels):
+            for ch in self._channels:
+                ch["visible"] = True
+            print("[Scope] saved settings hid every channel — showing all instead")
+        return applied > 0
 
     # ------------------------------------------------------------------
     # Cell detection (Analyze menu)
@@ -2028,6 +2403,7 @@ class ScopeWindow(QMainWindow):
             self._czi_data.get("um_per_px", 1.0),
             self._czi_data.get("z_um", 0.0),
             self,
+            source_path=self._czi_data.get("path", ""),
         )
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
@@ -2074,15 +2450,21 @@ class ScopeWindow(QMainWindow):
             self._detect_progress = None
 
         # Replace any existing markers / table rows with the detected cells.
+        # Clearing and refilling the table churns the selection; the guard stops
+        # each intermediate state from yanking the canvas around.
+        self._syncing_selection = True
         self.table_panel.table.setRowCount(0)
         self._markers = []
         for cell in results:
             row = cell.as_row(self._current_file or "unknown")
+            # No "num" on the marker: a cell's number is its position in the
+            # table, resolved at export, so nothing needs renumbering here.
             self._markers.append(
-                {"x": cell.x, "y": cell.y, "num": cell.num, "accepted": True,
+                {"x": cell.x, "y": cell.y, "accepted": True,
                  "z": int(cell.z), "length": row["length"]})
-            self.table_panel.add_row(row["img_name"], row["num"], row["x"],
-                                     row["y"], row["z"], row["length"])
+            self.table_panel.add_row(row["x"], row["y"], row["z"], row["length"],
+                                     img_name=row["img_name"])
+        self._syncing_selection = False
         self.overview_panel.canvas.set_markers(self._markers)
         self._update_cell_count()
 
@@ -2180,7 +2562,8 @@ class ScopeWindow(QMainWindow):
         self._proj_cache = {}
         subset = [ch["raw"] for ch in self._channels]
         worker = _ProjCacheWorker(self._slice_reader, subset,
-                                  self._czi_data.get("n_z", 1))
+                                  self._czi_data.get("n_z", 1),
+                                  ranges=getattr(self, "_display_ranges", {}))
         worker.channel_ready.connect(self._on_proj_channel_ready)
         worker.all_done.connect(
             lambda: self.status.showMessage(
@@ -2215,6 +2598,7 @@ class ScopeWindow(QMainWindow):
     def _on_file_loaded(self, czi_data: dict):
         self._czi_data     = czi_data
         self._current_file = os.path.basename(czi_data["path"])
+        self.table_panel.default_img_name = self._current_file
 
         # Stop background workers that hold the OLD reader BEFORE we close it,
         # otherwise a worker could read a closed file handle.
@@ -2269,6 +2653,15 @@ class ScopeWindow(QMainWindow):
                 "contrast":   1.0,
                 "min_lum":    0.0,
             })
+        # Reapply whatever levels were last in use, so a batch of files opens
+        # looking the same rather than resetting to flat defaults each time.
+        if self._apply_saved_channel_prefs():
+            shown = ", ".join(
+                f"{c['name']}(b{c['brightness']:.2f} c{c['contrast']:.2f} "
+                f"m{c['min_lum']:.2f}{'' if c['visible'] else ' hidden'})"
+                for c in self._channels)
+            print(f"[Scope] restored processing settings: {shown}")
+
         print(f"[Scope] _on_file_loaded: channels = "
               f"{[(c['raw'], c['name']) for c in self._channels]}")
 
@@ -2284,8 +2677,17 @@ class ScopeWindow(QMainWindow):
         self._zslice_floats = {}
         self._frame_shape   = None
 
+        # Per-channel display ranges measured over the whole volume by the loader,
+        # keyed by absolute channel index. Shared by the projection and the Z view.
+        subset_ranges = czi_data.get("display_ranges") or []
+        self._display_ranges = {
+            ch["raw"]: subset_ranges[i]
+            for i, ch in enumerate(self._channels)
+            if i < len(subset_ranges)
+        }
+
         # Create the background Z-slice reader for this file.
-        self._zworker = _ZSliceWorker(self._slice_reader)
+        self._zworker = _ZSliceWorker(self._slice_reader, ranges=self._display_ranges)
         self._zworker.ready.connect(self._on_zslice_ready)
         self._zworker.start()
 
@@ -2409,11 +2811,35 @@ class ScopeWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _on_cell_clicked(self, idx: int):
-        if idx >= len(self._markers):
+        """A marker pin was clicked on the overview."""
+        self._select_cell(idx, sync_table=True)
+
+    def _on_table_selection_changed(self):
+        """A table row was selected — do exactly what clicking its pin does.
+
+        Driven from the selection signal rather than a click signal so keyboard
+        navigation through the table works too. `_syncing_selection` breaks the
+        loop that would otherwise form: selecting a row moves the canvas, which
+        selects the row, which moves the canvas…
+        """
+        if self._syncing_selection:
+            return
+        row = self.table_panel.table.currentRow()
+        if row < 0:
+            return
+        self._select_cell(row, sync_table=False)
+
+    def _select_cell(self, idx: int, sync_table: bool = True):
+        if idx < 0 or idx >= len(self._markers):
             return
         m = self._markers[idx]
         self.overview_panel.canvas.highlight_marker(idx)
-        self.table_panel.table.selectRow(idx)
+        if sync_table:
+            self._syncing_selection = True
+            try:
+                self.table_panel.table.selectRow(idx)
+            finally:
+                self._syncing_selection = False
 
         # Center the right view on a fixed 30 µm × 30 µm window at the cell's Z.
         um   = self._czi_data.get("um_per_px", 1.0) or 1.0
@@ -2431,21 +2857,56 @@ class ScopeWindow(QMainWindow):
             self._request_z(z)        # already on this Z → re-render, then focus
 
         self.status.showMessage(
-            f"Cell {m['num']}  |  x={m['x']:.1f}  y={m['y']:.1f}  z={z}  "
+            f"Cell {idx + 1}  |  x={m['x']:.1f}  y={m['y']:.1f}  z={z}  "
             f"|  30 µm view"
         )
 
     def _on_marker_added(self, x: float, y: float):
-        num = max((m["num"] for m in self._markers), default=0) + 1
-        z   = self.zviewer_panel.z_slider.value()
-        self._markers.append({"x": x, "y": y, "num": num, "accepted": True,
+        z = self.zviewer_panel.z_slider.value()
+        self._markers.append({"x": x, "y": y, "accepted": True,
                               "z": int(z), "length": "—"})
         self.overview_panel.canvas.set_markers(self._markers)
-        self.table_panel.add_row(self._current_file or "unknown", num,
-                                  round(x, 1), round(y, 1), z, "—")
+        self.table_panel.add_row(round(x, 1), round(y, 1), z, "—",
+                                 img_name=self._current_file or "unknown")
         self.overview_panel.reset_mode()
         self._update_cell_count()
-        self.status.showMessage(f"Cell {num} added at ({x:.1f}, {y:.1f})  z={z}")
+        self.status.showMessage(
+            f"Cell {len(self._markers)} added at ({x:.1f}, {y:.1f})  z={z}")
+
+    def _suggested_output_path(self, suffix: str, ext: str) -> str:
+        """`<folder of the open image>/<image name> - <suffix><ext>`.
+
+        Falls back to a bare filename (so the dialog opens wherever it last was)
+        when nothing is loaded.
+        """
+        src = self._czi_data.get("path") or ""
+        if not src:
+            return f"cilia - {suffix}{ext}"
+        stem = os.path.basename(src)
+        for e in (".ome.tif", ".ome.tiff", ".czi", ".tif", ".tiff"):
+            if stem.lower().endswith(e):
+                stem = stem[:-len(e)]
+                break
+        else:
+            stem = os.path.splitext(stem)[0]
+        return os.path.join(os.path.dirname(src), f"{stem} - {suffix}{ext}")
+
+    def _on_export_csv(self):
+        default = self._suggested_output_path("Measurements", ".csv")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export measurements", default, "CSV files (*.csv)")
+        if not path:
+            return
+        if not os.path.splitext(path)[1]:
+            path += ".csv"
+        try:
+            n = self.table_panel.export_to(path)
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+            return
+        print(f"[Scope] Exported {n} row(s) to {path}")
+        self.status.showMessage(
+            f"Exported {n} cell(s) to {os.path.basename(path)}")
 
     def _on_import_csv(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2457,12 +2918,14 @@ class ScopeWindow(QMainWindow):
             with open(path, newline="") as f:
                 reader = csv.DictReader(f)
                 fields = {(c or "").strip() for c in (reader.fieldnames or [])}
-                required = {"num", "x", "y", "z", "length"}
+                required = {"x", "y", "z", "length"}
                 if not required.issubset(fields):
                     QMessageBox.warning(
                         self, "Import failed",
                         "That CSV doesn't match the export format.\n\n"
-                        f"Expected columns: {', '.join(DataTablePanel.COLUMNS)}")
+                        f"Expected columns: "
+                        f"{', '.join(DataTablePanel.EXPORT_COLUMNS)}\n"
+                        f"(img_name and num are optional)")
                     return
                 rows = list(reader)
         except Exception as e:
@@ -2475,6 +2938,7 @@ class ScopeWindow(QMainWindow):
             except (TypeError, ValueError):
                 return default
 
+        self._syncing_selection = True
         self.table_panel.table.setRowCount(0)
         self._markers = []
         skipped = 0
@@ -2484,14 +2948,17 @@ class ScopeWindow(QMainWindow):
             except (TypeError, ValueError, KeyError):
                 skipped += 1
                 continue
-            num    = _num(row.get("num"), i)
             z      = _num(row.get("z"), 0)
             length = (row.get("length") or "—").strip() or "—"
             img    = (row.get("img_name") or self._current_file or "imported").strip()
-            self._markers.append({"x": x, "y": y, "num": num, "accepted": True,
+            # The CSV's own "num" is ignored: numbering is regenerated on export
+            # from row order. The image name is kept, so a CSV imported from a
+            # different image still exports under that image's name.
+            self._markers.append({"x": x, "y": y, "accepted": True,
                                   "z": z, "length": length})
-            self.table_panel.add_row(img, num, round(x, 1), round(y, 1), z, length)
+            self.table_panel.add_row(round(x, 1), round(y, 1), z, length, img_name=img)
 
+        self._syncing_selection = False
         self.overview_panel.canvas.set_markers(self._markers)
         self._update_cell_count()
         msg = f"Imported {len(self._markers)} cell(s) from {os.path.basename(path)}"
@@ -2500,28 +2967,90 @@ class ScopeWindow(QMainWindow):
         self.status.showMessage(msg)
 
     def _on_markers_deleted(self, indices: list):
+        self._syncing_selection = True
         for i in sorted(indices, reverse=True):
             self._markers.pop(i)
-        for i, m in enumerate(self._markers):
-            m["num"] = i + 1
+        # Nothing to renumber — cell numbers are generated at export from row
+        # order, so a deletion is just a deletion.
         self.overview_panel.canvas.set_markers(self._markers)
         self.table_panel.remove_rows(indices)
+        self._syncing_selection = False
         self.overview_panel.reset_mode()
         self._update_cell_count()
         self.status.showMessage(f"{len(indices)} cell(s) removed")
 
-    def _on_measurement_done(self, length_px: float):
-        um_per_px = self._czi_data.get("um_per_px", 1.0)
-        length_um = length_px * um_per_px
-        selected = self.table_panel.table.selectedItems()
-        if selected:
+    # ------------------------------------------------------------------
+    # Manual 3-D ruler
+    # ------------------------------------------------------------------
+
+    def _on_measure_toggled(self, on: bool):
+        """Enabling the ruler starts a fresh measurement."""
+        self._measure_track = []
+        if on:
+            self.status.showMessage(
+                "Measure mode — trace the cilium on this slice, then change Z and "
+                "trace the next part; lengths add up in 3-D"
+            )
+        else:
+            self.status.showMessage("Measure mode OFF")
+
+    def _measure_total_um(self):
+        """Total physical length of the accumulated trace, in microns.
+
+        A cilium rarely lies flat in one plane, so the ruler is a chain of traces,
+        each drawn on its own slice. Within a trace the travel is in-plane and
+        scales by `um_per_px`; between traces the jump also has an axial component
+        of Δz slices, which scales by `z_um`. Measuring only in-plane on a single
+        slice — which is all the old ruler did — systematically undercounts every
+        cilium that runs through the stack, and the steeper it runs the worse the
+        undercount gets.
+        """
+        um = float(self._czi_data.get("um_per_px", 1.0) or 1.0)
+        z_um = float(self._czi_data.get("z_um", 0.0) or 0.0)
+        total = 0.0
+        prev_end = None            # (x, y, z)
+        for pts, z in self._measure_track:
+            arr = np.asarray(pts, dtype=np.float64)
+            if arr.shape[0] > 1:
+                d = np.diff(arr, axis=0)
+                total += float(np.sum(np.hypot(d[:, 0], d[:, 1]))) * um
+            if prev_end is not None:
+                dx = (arr[0, 0] - prev_end[0]) * um
+                dy = (arr[0, 1] - prev_end[1]) * um
+                dz = (z - prev_end[2]) * z_um
+                total += float(np.sqrt(dx * dx + dy * dy + dz * dz))
+            prev_end = (float(arr[-1, 0]), float(arr[-1, 1]), int(z))
+        return total, z_um
+
+    @pyqtSlot(object)
+    def _on_trace_done(self, pts: list):
+        if not pts or len(pts) < 2:
+            return
+        z = self.zviewer_panel.z_slider.value()
+        self._measure_track.append((pts, int(z)))
+        total_um, z_um = self._measure_total_um()
+        n = len(self._measure_track)
+
+        self.zviewer_panel.canvas.show_measure_label(f"{total_um:.2f} µm")
+
+        row_note = ""
+        if self.table_panel.table.selectedItems():
             row  = self.table_panel.table.currentRow()
-            item = QTableWidgetItem(f"{length_um:.2f} µm")
+            item = QTableWidgetItem(f"{total_um:.2f} µm")
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table_panel.table.setItem(row, 5, item)
-        self.status.showMessage(
-            f"Measurement: {length_px:.1f} px  ≈  {length_um:.2f} µm"
-        )
+            self.table_panel.table.setItem(row, DataTablePanel.LENGTH_COL, item)
+            row_note = f"  →  row {row + 1}"
+        else:
+            row_note = "  (select a table row to record it)"
+
+        axial = ""
+        if n > 1:
+            axial = (f"  |  {n} segments across Z"
+                     if z_um > 0 else
+                     f"  |  {n} segments, Z spacing unknown — axial travel NOT counted")
+        elif z_um <= 0:
+            axial = "  |  Z spacing unknown"
+        self.status.showMessage(f"Measured: {total_um:.2f} µm{axial}{row_note}")
 
     def _update_cell_count(self):
         n = sum(1 for m in self._markers if m["accepted"])

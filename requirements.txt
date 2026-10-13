@@ -1,18 +1,23 @@
+# Scope — runtime dependencies
+#
+# Python 3.12 (pylibCZIrw ships wheels for it; the venv in this repo is 3.12).
+
+# GUI + plotting
 PyQt6>=6.4.0
 matplotlib>=3.7.0
+
+# Arrays / image processing
 numpy>=1.24.0
-aicspylibczi
-pylibczirw
-scipy
-scikit-image
-ipywidgets
-tqdm
-czifile
-# aicspylibrary
-# scikit-image
-# scipy
-# cellpose
-# skan
-# pandas
-# napari
- 
+scipy>=1.10               # ndimage: label, EDT, gaussian_filter; spatial.KDTree
+scikit-image>=0.22        # threshold_otsu, skeletonize, regionprops
+
+# Microscopy file formats
+czifile>=2026.6.6         # CZI reading (the pure-Python rewrite: no CMake build)
+pylibCZIrw>=6.0.1         # CZI writing (save_processed_file's preferred writer)
+tifffile>=2024.1.1        # OME-TIFF read path + the fallback writer
+
+# Removed, and why:
+#   aicspylibczi  — not imported anywhere; czifile handles all reading.
+#   ipywidgets    — leftover from notebook prototyping.
+#   tqdm          — never imported; progress goes through Qt signals.
+#   cellpose / skan / napari / pandas — were only ever commented-out ideas.
